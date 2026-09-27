@@ -21,6 +21,12 @@ IMU version. JP226-GPS-IMU-Logger retains its familiar live GPS display and
 display controls while adding IMU telemetry, daily rollover, and an always-on
 movement-aware logging schedule.
 
+## Support the project
+
+If you like JP226-GPS-IMU-Logger and would like to support its continued
+development, donations are welcome through
+[JP226 Prints](https://jp226prints.au/).
+
 ## Hardware
 
 - M5Stack Cardputer ADV or original Cardputer
