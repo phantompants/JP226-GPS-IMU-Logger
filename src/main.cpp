@@ -31,6 +31,12 @@ enum class LogMode : uint8_t {
   FixLost,
 };
 
+enum class GpsPreference : uint8_t {
+  Auto = 0,
+  Grove = 1,
+  Cap = 2,
+};
+
 struct GpsSnapshot {
   bool fixValid = false;
   bool positionFresh = false;
@@ -191,10 +197,70 @@ class CsvLineBuilder {
   size_t length_ = 0;
 };
 
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
-TinyGPSCustom gngsaVdop(gps, "GNGSA", 17);
-TinyGPSCustom gpgsaVdop(gps, "GPGSA", 17);
+class GpsReceiver {
+ public:
+  GpsReceiver(uint8_t uartNumber, const char* name, int rxPin, int txPin)
+      : serial_(uartNumber),
+        name_(name),
+        rxPin_(rxPin),
+        txPin_(txPin),
+        gngsaVdop_(parser_, "GNGSA", 17),
+        gpgsaVdop_(parser_, "GPGSA", 17) {}
+
+  void begin(uint32_t baud) {
+    if (!started_) {
+      serial_.setRxBufferSize(2048);
+      started_ = true;
+    } else {
+      serial_.end();
+    }
+    baud_ = baud;
+    lastSentenceMs_ = 0;
+    serial_.begin(baud_, SERIAL_8N1, rxPin_, txPin_);
+  }
+
+  void poll(uint32_t nowMs) {
+    if (!started_) return;
+    const uint32_t checksumCount = parser_.passedChecksum();
+    while (serial_.available() > 0) {
+      parser_.encode(static_cast<char>(serial_.read()));
+    }
+    if (parser_.passedChecksum() != checksumCount) {
+      lastSentenceMs_ = nowMs;
+      detectedEver_ = true;
+    }
+  }
+
+  bool live(uint32_t nowMs) const {
+    return detectedEver_ && lastSentenceMs_ > 0 &&
+           nowMs - lastSentenceMs_ <= config::kGpsSourceStaleMs;
+  }
+
+  bool started() const { return started_; }
+  const char* name() const { return name_; }
+  uint32_t baud() const { return baud_; }
+  TinyGPSPlus& parser() { return parser_; }
+  TinyGPSCustom& gngsaVdop() { return gngsaVdop_; }
+  TinyGPSCustom& gpgsaVdop() { return gpgsaVdop_; }
+
+ private:
+  HardwareSerial serial_;
+  const char* name_;
+  int rxPin_;
+  int txPin_;
+  uint32_t baud_ = 0;
+  uint32_t lastSentenceMs_ = 0;
+  bool started_ = false;
+  bool detectedEver_ = false;
+  TinyGPSPlus parser_;
+  TinyGPSCustom gngsaVdop_;
+  TinyGPSCustom gpgsaVdop_;
+};
+
+GpsReceiver groveGps(1, "GROVE", config::kGroveGpsRxPin,
+                     config::kGroveGpsTxPin);
+GpsReceiver capGps(2, "CAP", config::kCapGpsRxPin, config::kCapGpsTxPin);
+GpsReceiver* activeGps = &groveGps;
 SPIClass sdSpi(FSPI);
 Preferences preferences;
 ImuSampler imu;
@@ -217,11 +283,14 @@ uint32_t lastSdAttemptMs = 0;
 uint32_t lastClockSyncMs = 0;
 uint64_t rowsWritten = 0;
 uint8_t displayBrightness = 128;
+size_t groveBaudIndex = 0;
+uint32_t groveBaudStartedMs = 0;
 time_t stopStartUtc = 0;
 time_t nextStoppedDueUtc = 0;
 time_t persistedStopStartUtc = 0;
 time_t persistedNextDueUtc = 0;
 LogMode mode = LogMode::WaitingForFix;
+GpsPreference gpsPreference = GpsPreference::Auto;
 
 int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
@@ -234,7 +303,7 @@ int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   return era * 146097LL + static_cast<int64_t>(dayOfEra) - 719468LL;
 }
 
-time_t gpsUtcEpoch() {
+time_t gpsUtcEpoch(TinyGPSPlus& gps) {
   if (!gps.date.isValid() || !gps.time.isValid()) {
     return 0;
   }
@@ -256,14 +325,15 @@ bool clockIsReady() {
   return now > 0 && gmtime_r(&now, &utc) != nullptr && utc.tm_year + 1900 >= 2024;
 }
 
-void syncClockFromGps(uint32_t nowMs) {
+void syncClockFromGps(GpsReceiver& receiver, uint32_t nowMs) {
+  TinyGPSPlus& gps = receiver.parser();
   if (!gps.date.isValid() || !gps.time.isValid() ||
       gps.date.age() > config::kMaxDateTimeAgeMs ||
       gps.time.age() > config::kMaxDateTimeAgeMs ||
       (clockIsReady() && nowMs - lastClockSyncMs < config::kClockResyncIntervalMs)) {
     return;
   }
-  const time_t epoch = gpsUtcEpoch();
+  const time_t epoch = gpsUtcEpoch(gps);
   if (epoch <= 0) {
     return;
   }
@@ -292,7 +362,8 @@ bool parseCustomFloat(TinyGPSCustom& custom, double& result) {
   return true;
 }
 
-GpsSnapshot takeGpsSnapshot() {
+GpsSnapshot takeGpsSnapshot(GpsReceiver& receiver) {
+  TinyGPSPlus& gps = receiver.parser();
   GpsSnapshot sample;
   sample.positionFresh = gps.location.isValid() && gps.location.age() <= config::kMaxFixAgeMs;
   sample.speedFresh = gps.speed.isValid() && gps.speed.age() <= config::kMaxFixAgeMs;
@@ -311,8 +382,8 @@ GpsSnapshot takeGpsSnapshot() {
   if (sample.courseFresh) sample.courseDeg = gps.course.deg();
   if (sample.satellitesValid) sample.satellites = gps.satellites.value();
   if (sample.hdopValid) sample.hdop = gps.hdop.hdop();
-  sample.vdopValid = parseCustomFloat(gngsaVdop, sample.vdop) ||
-                     parseCustomFloat(gpgsaVdop, sample.vdop);
+  sample.vdopValid = parseCustomFloat(receiver.gngsaVdop(), sample.vdop) ||
+                     parseCustomFloat(receiver.gpgsaVdop(), sample.vdop);
 
   const bool dateTimeFresh = gps.date.isValid() && gps.time.isValid() &&
                              gps.date.age() <= config::kMaxDateTimeAgeMs &&
@@ -608,6 +679,80 @@ void onLogSucceeded(uint32_t nowMs, time_t nowUtc) {
   }
 }
 
+bool isCardputerAdv() {
+  return M5.getBoard() == m5::board_t::board_M5CardputerADV;
+}
+
+const char* gpsPreferenceName() {
+  switch (gpsPreference) {
+    case GpsPreference::Grove:
+      return "GROVE";
+    case GpsPreference::Cap:
+      return "CAP";
+    default:
+      return "AUTO";
+  }
+}
+
+void selectGpsReceiver(uint32_t nowMs) {
+  GpsReceiver* selected = activeGps;
+  switch (gpsPreference) {
+    case GpsPreference::Grove:
+      selected = &groveGps;
+      break;
+    case GpsPreference::Cap:
+      selected = capGps.started() ? &capGps : &groveGps;
+      break;
+    case GpsPreference::Auto:
+      if (capGps.started() && capGps.live(nowMs)) {
+        selected = &capGps;
+      } else if (groveGps.live(nowMs)) {
+        selected = &groveGps;
+      } else if (selected == nullptr || !selected->started()) {
+        selected = &groveGps;
+      }
+      break;
+  }
+
+  if (selected != activeGps) {
+    activeGps = selected;
+    Serial.printf("GPS source: %s at %lu baud (preference %s)\n",
+                  activeGps->name(), static_cast<unsigned long>(activeGps->baud()),
+                  gpsPreferenceName());
+  }
+}
+
+void updateGpsReceivers(uint32_t nowMs) {
+  groveGps.poll(nowMs);
+  if (capGps.started()) capGps.poll(nowMs);
+
+  if (!groveGps.live(nowMs) &&
+      nowMs - groveBaudStartedMs >= config::kGpsBaudScanIntervalMs) {
+    groveBaudIndex =
+        (groveBaudIndex + 1) % config::kGroveGpsBaudCandidateCount;
+    groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
+    groveBaudStartedMs = nowMs;
+    Serial.printf("Scanning Grove GPS at %lu baud\n",
+                  static_cast<unsigned long>(groveGps.baud()));
+  }
+
+  selectGpsReceiver(nowMs);
+}
+
+void cycleGpsPreference() {
+  if (isCardputerAdv()) {
+    gpsPreference = static_cast<GpsPreference>(
+        (static_cast<uint8_t>(gpsPreference) + 1U) % 3U);
+  } else {
+    gpsPreference = gpsPreference == GpsPreference::Auto
+                        ? GpsPreference::Grove
+                        : GpsPreference::Auto;
+  }
+  preferences.putUChar("gps_src", static_cast<uint8_t>(gpsPreference));
+  selectGpsReceiver(millis());
+  lastDisplayMs = 0;
+}
+
 void handleControls() {
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
     return;
@@ -622,6 +767,8 @@ void handleControls() {
     } else {
       M5Cardputer.Display.sleep();
     }
+  } else if (M5Cardputer.Keyboard.isKeyPressed('g')) {
+    cycleGpsPreference();
   } else if (M5Cardputer.Keyboard.isKeyPressed('-')) {
     displayBrightness = displayBrightness >= 30 ? displayBrightness - 30 : 0;
     if (screenOn) M5Cardputer.Display.setBrightness(displayBrightness);
@@ -659,6 +806,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   if (sample.hdopValid) display.printf("%.2f", sample.hdop);
   else display.print("-");
   display.println();
+  display.printf("Src:%s %lu %s Pref:%s\n", activeGps->name(),
+                 static_cast<unsigned long>(activeGps->baud()),
+                 activeGps->live(nowMs) ? "OK" : "scan", gpsPreferenceName());
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   if (sample.positionFresh) {
     display.printf("Lat:%.6f\nLon:%.6f\n", sample.latitude, sample.longitude);
@@ -680,12 +830,18 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
     display.println("Clock: waiting for GPS UTC");
   }
   display.setTextColor(TFT_GREEN, TFT_BLACK);
-  display.print("LOG:ALWAYS ON  S:screen -/+:bright");
+  display.print("LOG:ON G:GPS S:screen -/+:bright");
   display.endWrite();
 }
 
 void loadPersistentState() {
   preferences.begin("gpsimu", false);
+  const uint8_t savedGpsPreference = preferences.getUChar("gps_src", 0);
+  if (savedGpsPreference <= static_cast<uint8_t>(GpsPreference::Cap) &&
+      (savedGpsPreference != static_cast<uint8_t>(GpsPreference::Cap) ||
+       isCardputerAdv())) {
+    gpsPreference = static_cast<GpsPreference>(savedGpsPreference);
+  }
   if (preferences.getUChar("state", 0) == 2) {
     persistedStopStartUtc =
         static_cast<time_t>(preferences.getULong64("stop_utc", 0));
@@ -713,25 +869,32 @@ void setup() {
   M5Cardputer.Display.println("Starting GPS + IMU logger...");
 
   imu.begin();
-  gpsSerial.setRxBufferSize(2048);
-  gpsSerial.begin(config::kGpsBaud, SERIAL_8N1, config::kGpsRxPin,
-                  config::kGpsTxPin);
   loadPersistentState();
+
+  groveBaudIndex = 0;
+  groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
+  groveBaudStartedMs = millis();
+  if (isCardputerAdv()) {
+    // The Cap LoRa radio and microSD share SPI pins. NSS is active-low, so
+    // holding it high prevents the unused SX1262 from driving the SD bus.
+    pinMode(config::kCapLoraCsPin, OUTPUT);
+    digitalWrite(config::kCapLoraCsPin, HIGH);
+    capGps.begin(config::kCapGpsBaud);
+  }
+  selectGpsReceiver(millis());
   mountSd(millis(), true);
 }
 
 void loop() {
   M5Cardputer.update();
   handleControls();
-  while (gpsSerial.available() > 0) {
-    gps.encode(static_cast<char>(gpsSerial.read()));
-  }
 
   const uint32_t nowMs = millis();
+  updateGpsReceivers(nowMs);
   imu.update(nowMs);
-  syncClockFromGps(nowMs);
+  syncClockFromGps(*activeGps, nowMs);
 
-  const GpsSnapshot gpsSample = takeGpsSnapshot();
+  const GpsSnapshot gpsSample = takeGpsSnapshot(*activeGps);
   const time_t nowUtc = time(nullptr);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
 

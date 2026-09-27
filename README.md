@@ -30,9 +30,11 @@ development, donations are welcome through
 ## Hardware
 
 - M5Stack Cardputer ADV or original Cardputer
-- M5Stack Unit GPS with AT6558, default 9600 baud
+- One supported UART NMEA GPS source:
+  - M5Stack Unit GPS with AT6558 (or another Grove NMEA receiver), or
+  - M5Stack Cap LoRa-1262 onboard ATGM336H-6N GPS on Cardputer ADV
 - FAT32 microSD card (32 GB or smaller is the conservative choice for Launcher)
-- HY2.0-4P/Grove cable
+- HY2.0-4P/Grove cable when using an external GPS Unit
 
 ### AT6558 wiring
 
@@ -46,8 +48,35 @@ The Cardputer and Cardputer ADV use the same Grove pinout.
 | White | GPS TX | GPIO1 | Cardputer RX (receives NMEA) |
 
 With an unmodified M5Stack Grove cable, simply plug the GPS Unit into the
-Cardputer's HY2.0-4P port. The firmware opens UART1 as RX=GPIO1, TX=GPIO2,
-9600/8-N-1. Do not connect the GPS UART to the ADV internal I2C pins GPIO8/9.
+Cardputer's HY2.0-4P port. The firmware uses UART1 as RX=GPIO1, TX=GPIO2 and
+automatically scans the common NMEA baud rates 9600, 115200, 38400, 4800,
+19200 and 57600. This supports the AT6558 plus other NMEA 0183 UART receivers.
+Do not connect a GPS UART to the ADV internal I2C pins GPIO8/9.
+
+### Cardputer ADV Cap LoRa-1262 GPS
+
+The ADV can instead use the ATGM336H-6N GPS built into the
+[M5Stack Cap LoRa-1262](https://docs.m5stack.com/en/cap/Cap_LoRa-1262). Attach
+the Cap to the ADV expansion header before powering on. Its GPS runs at
+115200/8-N-1 on UART2:
+
+| Cap signal | Cardputer ADV pin | Logger role |
+|---|---:|---|
+| GPS_TX | GPIO15 | Cardputer RX |
+| GPS_RX | GPIO13 | Cardputer TX |
+
+The logger monitors the Cap GPS and Grove GPS concurrently on the ADV. `AUTO`
+prefers a live Cap GPS and falls back to a live Grove GPS. Press `G` to cycle
+`AUTO`, `GROVE` and `CAP`; the selection is saved across restarts. On the
+original Cardputer, `G` cycles only `AUTO` and `GROVE`.
+
+> **Cap safety:** Install the supplied LoRa antenna before powering the Cap,
+> even though this logger does not transmit LoRa. M5Stack warns that powering
+> the Cap without its antenna can permanently damage the hardware. Power the
+> Cardputer off before attaching or removing the Cap.
+
+The Cap SX1262 and microSD share SPI pins. The firmware holds the unused LoRa
+NSS/CS pin (GPIO5) high so normal SD logging remains available.
 
 The microSD slot uses SCK=GPIO40, MISO=GPIO39, MOSI=GPIO14 and CS=GPIO12.
 
@@ -56,6 +85,7 @@ Hardware/API references:
 - [Cardputer ADV product and pin map](https://docs.m5stack.com/en/core/Cardputer-Adv)
 - [Official Cardputer ADV IMU example](https://docs.m5stack.com/en/arduino/m5cardputer/imu)
 - [M5Stack AT6558 GPS Unit](https://docs.m5stack.com/en/unit/gps)
+- [M5Stack Cap LoRa-1262 pin map and GPS specifications](https://docs.m5stack.com/en/cap/Cap_LoRa-1262)
 
 ## Open and build in VS Code
 
@@ -78,6 +108,7 @@ Prebuilt copies from the verified build are in `dist/`.
 
 | Key | Action |
 |---|---|
+| `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
 
@@ -171,7 +202,10 @@ All user-tunable constants are in `include/Config.h`. The main ones are:
 
 | Constant | Default | Meaning |
 |---|---:|---|
-| `kGpsBaud` | 9600 | AT6558 UART baud |
+| `kGroveGpsBaudCandidates` | 9600, 115200, 38400, 4800, 19200, 57600 | Grove NMEA auto-detection order |
+| `kCapGpsBaud` | 115200 | Cap LoRa-1262 ATGM336H baud |
+| `kGpsBaudScanIntervalMs` | 2.5 s | Time spent testing each Grove baud |
+| `kGpsSourceStaleMs` | 5 s | Source failover/detection timeout |
 | `kMoveStartKmh` | 3.0 km/h | Immediate moving threshold |
 | `kMoveStopKmh` | 1.5 km/h | Candidate stopped threshold |
 | `kStopConfirmMs` | 10 s | Low-speed dwell before stopped |

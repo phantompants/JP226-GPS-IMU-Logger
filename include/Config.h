@@ -4,12 +4,24 @@
 
 namespace config {
 
-// AT6558 on the Cardputer HY2.0-4P/Grove connector:
-// module TX (white) -> Cardputer GPIO1 (RX)
-// module RX (yellow) -> Cardputer GPIO2 (TX)
-constexpr int kGpsRxPin = 1;
-constexpr int kGpsTxPin = 2;
-constexpr uint32_t kGpsBaud = 9600;
+// UART NMEA GPS inputs. The Grove port accepts the AT6558 and other standard
+// NMEA 0183 receivers. Its common baud rates are scanned automatically.
+constexpr int kGroveGpsRxPin = 1;
+constexpr int kGroveGpsTxPin = 2;
+constexpr uint32_t kGroveGpsBaudCandidates[] = {9600, 115200, 38400,
+                                                4800, 19200,  57600};
+constexpr size_t kGroveGpsBaudCandidateCount =
+    sizeof(kGroveGpsBaudCandidates) / sizeof(kGroveGpsBaudCandidates[0]);
+
+// Cardputer ADV Cap LoRa-1262 onboard ATGM336H-6N GPS. The Cap is only
+// initialized when M5Unified identifies a Cardputer ADV.
+constexpr int kCapGpsRxPin = 15;  // Cap GPS_TX -> Cardputer ADV GPIO15
+constexpr int kCapGpsTxPin = 13;  // Cardputer ADV GPIO13 -> Cap GPS_RX
+constexpr uint32_t kCapGpsBaud = 115200;
+constexpr int kCapLoraCsPin = 5;  // Keep SX1262 deselected while SD uses SPI.
+
+constexpr uint32_t kGpsBaudScanIntervalMs = 2'500;
+constexpr uint32_t kGpsSourceStaleMs = 5'000;
 
 // Australia/Sydney, including current daylight-saving transitions. Change this
 // POSIX TZ string if the logger is used in another local time zone.
