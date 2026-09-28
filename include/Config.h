@@ -23,6 +23,20 @@ constexpr int kCapLoraCsPin = 5;  // Keep SX1262 deselected while SD uses SPI.
 constexpr uint32_t kGpsBaudScanIntervalMs = 2'500;
 constexpr uint32_t kGpsSourceStaleMs = 5'000;
 
+// Optional Wi-Fi/NTP and coordinate-based timezone discovery. Credentials and
+// overrides are read from kLoggerConfigPath on the SD card; they are never
+// compiled into the firmware.
+constexpr char kLoggerConfigPath[] = "/telemetry/logger.cfg";
+constexpr char kNtpServer1[] = "pool.ntp.org";
+constexpr char kNtpServer2[] = "time.google.com";
+constexpr char kNtpServer3[] = "time.cloudflare.com";
+constexpr char kTimezoneLookupUrl[] =
+    "https://timeapi.io/api/timezone/coordinate";
+constexpr uint32_t kWifiRetryIntervalMs = 60'000;
+constexpr uint32_t kTimezoneLookupRetryMs = 15 * 60 * 1000UL;
+constexpr uint32_t kTimezoneLookupIntervalMs = 6 * 60 * 60 * 1000UL;
+constexpr uint32_t kTimezoneHttpTimeoutMs = 5'000;
+
 // Australia/Sydney, including current daylight-saving transitions. Change this
 // POSIX TZ string if the logger is used in another local time zone.
 constexpr char kPosixTimezone[] = "AEST-10AEDT,M10.1.0,M4.1.0/3";

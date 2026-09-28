@@ -1,0 +1,13 @@
+# Copy this file to /telemetry/logger.cfg on the Cardputer microSD card.
+# Do not commit a copy containing your real Wi-Fi password.
+
+wifi_ssid=Your Starlink WiFi name
+wifi_password=Your Starlink WiFi password
+
+# When true, a stationary logger with a fresh GPS position and Internet access
+# asks timeapi.io for the local timezone and saves the result for offline use.
+timezone_auto=true
+
+# Optional POSIX timezone fallback/override. Leave blank to use the saved zone
+# or the firmware default (Australia/Sydney).
+# timezone=AEST-10AEDT,M10.1.0,M4.1.0/3

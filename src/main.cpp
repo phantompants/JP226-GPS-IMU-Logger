@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "Config.h"
+#include "LocationTime.h"
 #include "LogSchedule.h"
 
 namespace {
@@ -264,10 +265,12 @@ GpsReceiver* activeGps = &groveGps;
 SPIClass sdSpi(FSPI);
 Preferences preferences;
 ImuSampler imu;
+LocationTime locationTime;
 File logFile;
 String currentLogPath;
 
 bool sdMounted = false;
+bool locationTimeStarted = false;
 bool screenOn = true;
 bool immediateLogRequested = false;
 bool stopCandidateActive = false;
@@ -281,6 +284,7 @@ uint32_t lastFixLostLogMs = 0;
 uint32_t lastDisplayMs = 0;
 uint32_t lastSdAttemptMs = 0;
 uint32_t lastClockSyncMs = 0;
+uint32_t lastRtcWriteMs = 0;
 uint64_t rowsWritten = 0;
 uint8_t displayBrightness = 128;
 size_t groveBaudIndex = 0;
@@ -345,6 +349,20 @@ void syncClockFromGps(GpsReceiver& receiver, uint32_t nowMs) {
     struct tm utc {};
     gmtime_r(&epoch, &utc);
     M5.Rtc.setDateTime(&utc);
+  }
+}
+
+void syncRtcFromSystem(uint32_t nowMs) {
+  constexpr uint32_t kRtcWriteIntervalMs = 60 * 60 * 1000UL;
+  if (!M5.Rtc.isEnabled() || !clockIsReady() ||
+      (lastRtcWriteMs > 0 && nowMs - lastRtcWriteMs < kRtcWriteIntervalMs)) {
+    return;
+  }
+  const time_t nowUtc = time(nullptr);
+  struct tm utc {};
+  if (gmtime_r(&nowUtc, &utc) != nullptr) {
+    M5.Rtc.setDateTime(&utc);
+    lastRtcWriteMs = nowMs;
   }
 }
 
@@ -829,6 +847,8 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   } else {
     display.println("Clock: waiting for GPS UTC");
   }
+  display.printf("TZ:%s (%s)\n", locationTime.zoneName(),
+                 locationTime.zoneSource());
   display.setTextColor(TFT_GREEN, TFT_BLACK);
   display.print("LOG:ON G:GPS S:screen -/+:bright");
   display.endWrite();
@@ -882,7 +902,10 @@ void setup() {
     capGps.begin(config::kCapGpsBaud);
   }
   selectGpsReceiver(millis());
-  mountSd(millis(), true);
+  if (mountSd(millis(), true)) {
+    locationTime.begin(SD, preferences);
+    locationTimeStarted = true;
+  }
 }
 
 void loop() {
@@ -895,6 +918,9 @@ void loop() {
   syncClockFromGps(*activeGps, nowMs);
 
   const GpsSnapshot gpsSample = takeGpsSnapshot(*activeGps);
+  locationTime.update(gpsSample.latitude, gpsSample.longitude,
+                      gpsSample.positionFresh, gpsSample.speedKmh, nowMs);
+  syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
 
@@ -904,6 +930,10 @@ void loop() {
   }
 
   mountSd(nowMs);
+  if (sdMounted && !locationTimeStarted) {
+    locationTime.begin(SD, preferences);
+    locationTimeStarted = true;
+  }
   drawStatus(gpsSample, nowMs, nowUtc);
   delay(2);
 }

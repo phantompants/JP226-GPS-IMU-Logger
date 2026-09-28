@@ -141,22 +141,53 @@ Logs are written to:
 /telemetry/telemetry_YYYY-MM-DD.csv
 ```
 
-`YYYY-MM-DD` is the **local calendar date**, not UTC. A new file is opened on the
-first record after local midnight. `timestamp` remains UTC (`...Z`) for stable
-analysis, while `local_timestamp` includes the local UTC offset.
+`YYYY-MM-DD` is the **resolved local calendar date**, not UTC. A new file is
+opened on the first record after local midnight. If the timezone changes while
+travelling, the next record is routed to the correct local-date file.
+`timestamp` remains UTC (`...Z`) for stable analysis, while `local_timestamp`
+includes the active local UTC offset.
 
-The default timezone is Australia/Sydney, including daylight-saving transitions:
+Time and timezone are resolved independently:
+
+1. GPS provides authoritative UTC whenever a fresh NMEA date/time is available.
+2. If Starlink or another configured Wi-Fi network is available, NTP also keeps
+   UTC synchronized.
+3. With `timezone_auto=true`, a fresh GPS position is sent to `timeapi.io` while
+   the vehicle is stopped. The returned timezone is applied and saved in NVS.
+4. Offline, the last successfully resolved timezone is reused.
+5. With no saved result, the fallback is Australia/Sydney, including DST:
 
 ```cpp
 constexpr char kPosixTimezone[] = "AEST-10AEDT,M10.1.0,M4.1.0/3";
 ```
 
-Change that value in `include/Config.h` for another location.
+For Australian zones, the firmware maps the returned IANA zone to full POSIX
+DST rules. Elsewhere it uses the service's current UTC offset and refreshes it
+every six hours when stopped and online. If automatic location lookup is not
+wanted, set `timezone_auto=false` and provide a POSIX `timezone=` rule.
+
+### Optional Starlink/Wi-Fi configuration
+
+Copy `logger.cfg.example` to `/telemetry/logger.cfg` on the logging microSD card,
+then edit it:
+
+```ini
+wifi_ssid=Your Starlink WiFi name
+wifi_password=Your Starlink WiFi password
+timezone_auto=true
+# timezone=AEST-10AEDT,M10.1.0,M4.1.0/3
+```
+
+The logger never requires Wi-Fi to record. Wi-Fi is used only for NTP and the
+optional coordinate-to-timezone lookup. The configuration file stores the
+Wi-Fi password as plain text on the SD card, so keep the card private. Automatic
+timezone lookup sends the current GPS coordinates to `timeapi.io`; set
+`timezone_auto=false` to disable this.
 
 On the ADV, M5Unified restores system UTC from the onboard RTC at boot. A fresh
-GPS date/time periodically corrects the clock and updates that RTC. The original
-Cardputer has no RTC, so after a cold restart it waits for a valid GPS UTC date
-and time before creating a file; this prevents wrongly dated files.
+GPS or NTP time periodically corrects that RTC. The original Cardputer has no
+RTC, so after a cold restart it waits for valid GPS or NTP time before creating
+a file; this prevents wrongly dated files.
 
 Each append is flushed immediately. If the SD card is missing or an append
 fails, the logger closes the file and retries the card every 10 seconds. An
@@ -206,6 +237,8 @@ All user-tunable constants are in `include/Config.h`. The main ones are:
 | `kCapGpsBaud` | 115200 | Cap LoRa-1262 ATGM336H baud |
 | `kGpsBaudScanIntervalMs` | 2.5 s | Time spent testing each Grove baud |
 | `kGpsSourceStaleMs` | 5 s | Source failover/detection timeout |
+| `kTimezoneLookupIntervalMs` | 6 h | Online location-timezone refresh interval |
+| `kTimezoneLookupRetryMs` | 15 min | Retry delay after an unavailable lookup |
 | `kMoveStartKmh` | 3.0 km/h | Immediate moving threshold |
 | `kMoveStopKmh` | 1.5 km/h | Candidate stopped threshold |
 | `kStopConfirmMs` | 10 s | Low-speed dwell before stopped |
@@ -260,9 +293,12 @@ intentional and keeps them numeric-friendly for CSV import.
 
 ```text
 include/Config.h          hardware pins, thresholds and intervals
+include/LocationTime.h    Wi-Fi/NTP/location-timezone interface
 include/LogSchedule.h     pure stopped-schedule interface
+src/LocationTime.cpp      optional network time and timezone implementation
 src/LogSchedule.cpp       15-minute/hourly boundary calculations
 src/main.cpp              GPS, IMU, clock, NVS, SD, CSV and display logic
+logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests
 dist/                     verified Launcher and factory binaries
 ```
