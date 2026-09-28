@@ -933,8 +933,10 @@ void loop() {
   syncClockFromGps(*activeGps, nowMs);
 
   const GpsSnapshot gpsSample = takeGpsSnapshot(*activeGps);
-  locationTime.update(gpsSample.latitude, gpsSample.longitude,
-                      gpsSample.positionFresh, gpsSample.speedKmh, nowMs);
+  if (!wifiSetup.active()) {
+    locationTime.update(gpsSample.latitude, gpsSample.longitude,
+                        gpsSample.positionFresh, gpsSample.speedKmh, nowMs);
+  }
   wifiSetup.update(nowMs);
   syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
