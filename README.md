@@ -110,13 +110,15 @@ Prebuilt copies from the verified build are in `dist/`.
 |---|---|
 | `Tab`, `]` or Fn+right | Next large-text dashboard page |
 | `[` or Fn+left | Previous dashboard page |
-| `1`–`9` | Open a dashboard page directly |
+| `1`–`9` | Open dashboard pages 1–9 directly |
+| `0` | Open the KML export page (page 10) |
 | `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
 | `W` | Open the Wi-Fi setup page and scan for nearby networks |
+| `K` | Open the KML page and rescan all finished days for missing exports |
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
 
-The selected page is remembered across restarts. The nine pages are:
+The selected page is remembered across restarts. The ten pages are:
 
 1. Combined GPS/IMU summary
 2. Large current speed
@@ -127,6 +129,7 @@ The selected page is remembered across restarts. The nine pages are:
 7. Wi-Fi connection status and setup shortcut
 8. Logger, SD card, row count, file and parked-schedule status
 9. Large local clock, date and timezone status
+10. Daily CSV-to-KML export status and manual rescan
 
 Dashboard and Wi-Fi setup frames are drawn off-screen and transferred to the
 LCD in one operation to prevent visible clearing/flicker. Wi-Fi results use
@@ -234,6 +237,38 @@ Each append is flushed immediately. If the SD card is missing or an append
 fails, the logger closes the file and retries the card every 10 seconds. An
 existing daily file is appended to and does not receive a second header.
 
+## Google Earth and Google Maps KML export
+
+Every finished local-calendar-day CSV is automatically converted to:
+
+```text
+/telemetry/kml/telemetry_YYYY-MM-DD.kml
+```
+
+The current day's CSV is deliberately skipped because it is still being
+written. At local midnight the logger closes the old file, queues it for
+conversion, and continues logging to the new date. On every boot it also scans
+for older CSV files that do not yet have a KML. Press `K` at any time to open
+page 10 and run that scan manually.
+
+Conversion is streamed a few CSV rows at a time so a large file is never loaded
+into RAM and GPS reception continues in the background. Only valid latitude and
+longitude rows are included. Current 26-column logs require `fix_valid=1`;
+older compatible logs without that column are accepted when their `lat` and
+`lon` values are valid. The route is stored as a ground-clamped KML
+`LineString`, using the required `longitude,latitude,altitude` coordinate order.
+
+The exporter writes a `.tmp` file first and renames it only after the complete
+KML is safely closed. A restart or power loss therefore cannot leave a partial
+file with a finished `.kml` name. If travel across timezones causes a date to be
+reopened, its previous KML is removed and regenerated after that date is
+finished again.
+
+Open the `.kml` directly in Google Earth. For Google Maps, import it into
+[Google My Maps](https://support.google.com/mymaps/answer/3024836), then open the
+saved My Map from Google Maps. The generated structure follows Google's
+[KML `LineString` reference](https://developers.google.com/kml/documentation/kmlreference#linestring).
+
 ## Logging state machine
 
 | State | Entry condition | Record schedule |
@@ -291,6 +326,8 @@ All user-tunable constants are in `include/Config.h`. The main ones are:
 | `kMaximumHdop` | 5.0 | Fix quality gate |
 | `kMaxFixAgeMs` | 3 s | Maximum location/speed age |
 | `kImuSampleIntervalMs` | 10 ms | ADV IMU sampling target (100 Hz) |
+| `kKmlLinesPerUpdate` | 12 | CSV rows converted during each non-blocking pass |
+| `kKmlFlushEveryPoints` | 128 | KML points written between SD flushes |
 
 The AT6558's factory NMEA update rate is normally 1 Hz, so the default moving
 log rate is also 1 Hz. If the receiver is separately configured for a faster
@@ -334,9 +371,11 @@ intentional and keeps them numeric-friendly for CSV import.
 
 ```text
 include/Config.h          hardware pins, thresholds and intervals
+include/KmlExporter.h     restart-safe streaming KML export interface
 include/LocationTime.h    Wi-Fi/NTP/location-timezone interface
 include/LogSchedule.h     pure stopped-schedule interface
 src/LocationTime.cpp      optional network time and timezone implementation
+src/KmlExporter.cpp       daily CSV discovery and Google KML generation
 src/LogSchedule.cpp       15-minute/hourly boundary calculations
 src/main.cpp              GPS, IMU, clock, NVS, SD, CSV and display logic
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration

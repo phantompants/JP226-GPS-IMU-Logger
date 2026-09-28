@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "Config.h"
+#include "KmlExporter.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
 #include "WifiSetupPage.h"
@@ -50,6 +51,7 @@ enum class DashboardPage : uint8_t {
   Wifi,
   Logger,
   TimeNetwork,
+  KmlExport,
   Count,
 };
 
@@ -282,10 +284,12 @@ SPIClass sdSpi(FSPI);
 Preferences preferences;
 ImuSampler imu;
 LocationTime locationTime;
+KmlExporter kmlExporter;
 WifiSetupPage wifiSetup;
 M5Canvas dashboardCanvas(&M5Cardputer.Display);
 File logFile;
 String currentLogPath;
+String lastKmlScanDate;
 
 bool sdMounted = false;
 bool locationTimeStarted = false;
@@ -592,6 +596,25 @@ String pathForLocalDay(time_t nowUtc) {
   return String(path);
 }
 
+String localDateText(time_t nowUtc) {
+  struct tm local {};
+  localtime_r(&nowUtc, &local);
+  char date[16]{};
+  snprintf(date, sizeof(date), "%04d-%02d-%02d", local.tm_year + 1900,
+           local.tm_mon + 1, local.tm_mday);
+  return String(date);
+}
+
+void closeCompletedDailyFile(time_t nowUtc) {
+  if (currentLogPath.isEmpty() || currentLogPath == pathForLocalDay(nowUtc)) {
+    return;
+  }
+  const String completedPath = currentLogPath;
+  if (logFile) logFile.close();
+  currentLogPath = "";
+  kmlExporter.queueCompletedFile(completedPath);
+}
+
 void markSdFailed(uint32_t nowMs) {
   if (logFile) logFile.close();
   currentLogPath = "";
@@ -621,7 +644,13 @@ bool openDailyFile(time_t nowUtc, uint32_t nowMs) {
   const String requiredPath = pathForLocalDay(nowUtc);
   if (logFile && currentLogPath == requiredPath) return true;
   if (logFile) logFile.close();
+  if (!currentLogPath.isEmpty()) {
+    kmlExporter.queueCompletedFile(currentLogPath);
+  }
   currentLogPath = requiredPath;
+  // A timezone change can legitimately reopen an earlier local-date CSV.
+  // Remove any older export so it cannot remain stale while rows are appended.
+  kmlExporter.invalidateForCsv(currentLogPath);
   logFile = SD.open(currentLogPath, FILE_APPEND);
   if (!logFile) {
     markSdFailed(nowMs);
@@ -839,6 +868,9 @@ void handleControls() {
       M5Cardputer.Display.setBrightness(displayBrightness);
     }
     wifiSetup.open();
+  } else if (M5Cardputer.Keyboard.isKeyPressed('k')) {
+    if (sdMounted && clockIsReady()) kmlExporter.requestScan();
+    selectDashboardPage(DashboardPage::KmlExport);
   } else if (M5Cardputer.Keyboard.isKeyPressed('-')) {
     displayBrightness = displayBrightness >= 30 ? displayBrightness - 30 : 0;
     if (screenOn) M5Cardputer.Display.setBrightness(displayBrightness);
@@ -846,8 +878,11 @@ void handleControls() {
     displayBrightness = displayBrightness <= 225 ? displayBrightness + 30 : 255;
     if (screenOn) M5Cardputer.Display.setBrightness(displayBrightness);
   } else {
-    for (uint8_t index = 0;
-         index < static_cast<uint8_t>(DashboardPage::Count); ++index) {
+    if (M5Cardputer.Keyboard.isKeyPressed('0')) {
+      selectDashboardPage(DashboardPage::KmlExport);
+      return;
+    }
+    for (uint8_t index = 0; index < 9; ++index) {
       if (M5Cardputer.Keyboard.isKeyPressed(static_cast<char>('1' + index))) {
         selectDashboardPage(static_cast<DashboardPage>(index));
         break;
@@ -1153,6 +1188,30 @@ void drawTimeNetworkPage(time_t nowUtc) {
   drawPageFooter();
 }
 
+void drawKmlExportPage() {
+  auto& display = dashboardCanvas;
+  drawPageTitle("KML EXPORT");
+  display.setTextSize(2);
+  display.setCursor(3, 25);
+  display.setTextColor(kmlExporter.failedCount() == 0 ? TFT_GREEN : TFT_ORANGE,
+                       TFT_BLACK);
+  display.printf("%s\n", kmlExporter.phaseName());
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.printf("Done:%u  Err:%u\n", kmlExporter.completedCount(),
+                 kmlExporter.failedCount());
+  display.printf("Queue:%u Pts:%lu\n", kmlExporter.queuedCount(),
+                 static_cast<unsigned long>(kmlExporter.pointsWritten()));
+  display.setTextSize(1);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.println(displayClip(kmlExporter.currentFile(), 36));
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.println(displayClip(kmlExporter.lastMessage(), 36));
+  display.setTextSize(2);
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.drawString("K: SCAN OLD DAYS", 3, 105);
+  drawPageFooter();
+}
+
 void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   if (!screenOn || wifiSetup.active()) return;
   if (nowMs - lastDisplayMs < config::kDisplayIntervalMs) return;
@@ -1202,6 +1261,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
       break;
     case DashboardPage::TimeNetwork:
       drawTimeNetworkPage(nowUtc);
+      break;
+    case DashboardPage::KmlExport:
+      drawKmlExportPage();
       break;
     default:
       break;
@@ -1258,6 +1320,8 @@ void setup() {
 
   imu.begin();
   loadPersistentState();
+  kmlExporter.begin(SD, config::kLogDirectory, config::kFilePrefix,
+                    config::kKmlDirectory);
 
   groveBaudIndex = 0;
   groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
@@ -1293,6 +1357,7 @@ void loop() {
   wifiSetup.update(nowMs);
   syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
+  if (clockIsReady()) closeCompletedDailyFile(nowUtc);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
 
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&
@@ -1304,6 +1369,14 @@ void loop() {
   if (sdMounted && !locationTimeStarted) {
     locationTime.begin(SD, preferences);
     locationTimeStarted = true;
+  }
+  if (sdMounted && clockIsReady()) {
+    const String currentDate = localDateText(nowUtc);
+    if (currentDate != lastKmlScanDate) {
+      lastKmlScanDate = currentDate;
+      kmlExporter.requestScan();
+    }
+    kmlExporter.update(currentLogPath, currentDate);
   }
   drawStatus(gpsSample, nowMs, nowUtc);
   wifiSetup.draw(nowMs);

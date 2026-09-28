@@ -75,6 +75,9 @@ constexpr uint32_t kSdFrequencyHz = 25'000'000;
 
 constexpr char kLogDirectory[] = "/telemetry";
 constexpr char kFilePrefix[] = "telemetry_";
+constexpr char kKmlDirectory[] = "/telemetry/kml";
+constexpr uint16_t kKmlLinesPerUpdate = 12;
+constexpr uint16_t kKmlFlushEveryPoints = 128;
 
 }  // namespace config
 
