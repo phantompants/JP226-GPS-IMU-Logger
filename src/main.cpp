@@ -4,6 +4,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <TinyGPSPlus.h>
+#include <WiFi.h>
 #include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
@@ -37,6 +38,19 @@ enum class GpsPreference : uint8_t {
   Auto = 0,
   Grove = 1,
   Cap = 2,
+};
+
+enum class DashboardPage : uint8_t {
+  Combined = 0,
+  Speed,
+  HudSpeed,
+  GpsStatus,
+  ImuStatus,
+  GpsSetup,
+  Wifi,
+  Logger,
+  TimeNetwork,
+  Count,
 };
 
 struct GpsSnapshot {
@@ -133,6 +147,7 @@ class ImuSampler {
 
   bool available() const { return available_; }
   const char* typeName() const { return typeName_; }
+  const ImuSample& latest() const { return latest_; }
 
  private:
   static const char* imuTypeName(m5::imu_t type) {
@@ -268,6 +283,7 @@ Preferences preferences;
 ImuSampler imu;
 LocationTime locationTime;
 WifiSetupPage wifiSetup;
+M5Canvas hudCanvas(&M5Cardputer.Display);
 File logFile;
 String currentLogPath;
 
@@ -297,6 +313,8 @@ time_t persistedStopStartUtc = 0;
 time_t persistedNextDueUtc = 0;
 LogMode mode = LogMode::WaitingForFix;
 GpsPreference gpsPreference = GpsPreference::Auto;
+DashboardPage dashboardPage = DashboardPage::Combined;
+bool hudCanvasReady = false;
 
 int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
@@ -773,6 +791,19 @@ void cycleGpsPreference() {
   lastDisplayMs = 0;
 }
 
+void selectDashboardPage(DashboardPage page) {
+  dashboardPage = page;
+  preferences.putUChar("page", static_cast<uint8_t>(page));
+  lastDisplayMs = 0;
+}
+
+void moveDashboardPage(int direction) {
+  const int count = static_cast<int>(DashboardPage::Count);
+  const int current = static_cast<int>(dashboardPage);
+  selectDashboardPage(
+      static_cast<DashboardPage>((current + direction + count) % count));
+}
+
 void handleControls() {
   if (wifiSetup.active()) {
     wifiSetup.handleInput(locationTime);
@@ -784,6 +815,7 @@ void handleControls() {
     return;
   }
 
+  auto& keys = M5Cardputer.Keyboard.keysState();
   if (M5Cardputer.Keyboard.isKeyPressed('s')) {
     screenOn = !screenOn;
     if (screenOn) {
@@ -793,6 +825,11 @@ void handleControls() {
     } else {
       M5Cardputer.Display.sleep();
     }
+  } else if (keys.tab || keys.right ||
+             M5Cardputer.Keyboard.isKeyPressed(']')) {
+    moveDashboardPage(1);
+  } else if (keys.left || M5Cardputer.Keyboard.isKeyPressed('[')) {
+    moveDashboardPage(-1);
   } else if (M5Cardputer.Keyboard.isKeyPressed('g')) {
     cycleGpsPreference();
   } else if (M5Cardputer.Keyboard.isKeyPressed('w')) {
@@ -808,6 +845,14 @@ void handleControls() {
   } else if (M5Cardputer.Keyboard.isKeyPressed('=')) {
     displayBrightness = displayBrightness <= 225 ? displayBrightness + 30 : 255;
     if (screenOn) M5Cardputer.Display.setBrightness(displayBrightness);
+  } else {
+    for (uint8_t index = 0;
+         index < static_cast<uint8_t>(DashboardPage::Count); ++index) {
+      if (M5Cardputer.Keyboard.isKeyPressed(static_cast<char>('1' + index))) {
+        selectDashboardPage(static_cast<DashboardPage>(index));
+        break;
+      }
+    }
   }
 }
 
@@ -822,6 +867,250 @@ const char* boardName() {
   }
 }
 
+String displayClip(const String& value, size_t maximum) {
+  if (value.length() <= maximum) return value;
+  if (maximum <= 3) return value.substring(0, maximum);
+  return value.substring(0, maximum - 3) + "...";
+}
+
+void drawPageTitle(const char* title, uint16_t color = TFT_CYAN) {
+  auto& display = M5Cardputer.Display;
+  display.setTextDatum(top_left);
+  display.setTextSize(2);
+  display.setTextColor(color, TFT_BLACK);
+  display.drawString(title, 2, 1);
+  display.drawFastHLine(0, 19, display.width(), color);
+}
+
+void drawPageFooter(const char* hint = "[ ]/Tab: pages") {
+  auto& display = M5Cardputer.Display;
+  display.setTextDatum(bottom_left);
+  display.setTextSize(1);
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  char footer[48]{};
+  snprintf(footer, sizeof(footer), "%s  %u/%u", hint,
+           static_cast<unsigned>(dashboardPage) + 1,
+           static_cast<unsigned>(DashboardPage::Count));
+  display.drawString(footer, 2, display.height() - 1);
+  display.setTextDatum(top_left);
+}
+
+void drawCombinedPage(const GpsSnapshot& sample) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("GPS + IMU");
+  char speed[24]{};
+  snprintf(speed, sizeof(speed), sample.speedFresh ? "%.1f km/h" : "-- km/h",
+           sample.speedKmh);
+  display.setTextDatum(middle_center);
+  display.setTextSize(4);
+  display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.drawString(speed, display.width() / 2, 47);
+
+  display.setTextDatum(top_left);
+  display.setTextSize(2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setCursor(3, 73);
+  display.printf("GPS:%s SAT:%lu\n", sample.fixValid ? "FIX" : "WAIT",
+                 static_cast<unsigned long>(sample.satellites));
+  display.printf("IMU:%s  SD:%s\n", imu.available() ? "OK" : "N/A",
+                 sdMounted ? "OK" : "ERR");
+  drawPageFooter();
+}
+
+void drawSpeedPage(const GpsSnapshot& sample) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("SPEED");
+  char speed[16]{};
+  snprintf(speed, sizeof(speed), sample.speedFresh ? "%.1f" : "--",
+           sample.speedKmh);
+  display.setTextDatum(middle_center);
+  display.setTextSize(6);
+  display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.drawString(speed, display.width() / 2, 60);
+  display.setTextSize(2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString("km/h", display.width() / 2, 104);
+  drawPageFooter();
+}
+
+void drawHudSpeedPage(const GpsSnapshot& sample) {
+  auto& display = M5Cardputer.Display;
+  if (!hudCanvasReady) {
+    drawPageTitle("HUD unavailable", TFT_ORANGE);
+    display.setTextSize(2);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.drawString("Not enough memory", 8, 48);
+    drawPageFooter();
+    return;
+  }
+
+  char speed[16]{};
+  snprintf(speed, sizeof(speed), sample.speedFresh ? "%.0f" : "--",
+           sample.speedKmh);
+  hudCanvas.fillScreen(TFT_BLACK);
+  hudCanvas.setTextDatum(middle_center);
+  hudCanvas.setTextSize(7);
+  hudCanvas.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  hudCanvas.drawString(speed, hudCanvas.width() / 2, 54);
+  hudCanvas.setTextSize(3);
+  hudCanvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  hudCanvas.drawString("km/h", hudCanvas.width() / 2, 108);
+  hudCanvas.setTextSize(1);
+  hudCanvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  hudCanvas.drawString("HUD  [ ] change page", hudCanvas.width() / 2, 128);
+  hudCanvas.setPivot(hudCanvas.width() / 2, hudCanvas.height() / 2);
+  hudCanvas.pushRotateZoom(display.width() / 2, display.height() / 2, 0.0f,
+                           -1.0f, 1.0f);
+}
+
+void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("GPS STATUS");
+  display.setTextSize(2);
+  display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.setCursor(3, 25);
+  display.printf("%s  %lu SAT\n", sample.fixValid ? "FIX" : "NO FIX",
+                 static_cast<unsigned long>(sample.satellites));
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (sample.positionFresh) {
+    display.printf("LAT %.6f\nLON %.6f\n", sample.latitude, sample.longitude);
+  } else {
+    display.println("LAT --\nLON --");
+  }
+  display.printf("%s %s H:", activeGps->name(),
+                 activeGps->live(nowMs) ? "LIVE" : "SCAN");
+  if (sample.hdopValid) display.printf("%.1f", sample.hdop);
+  else display.print("--");
+  drawPageFooter();
+}
+
+void drawImuStatusPage() {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("IMU STATUS");
+  display.setTextSize(2);
+  display.setCursor(3, 27);
+  if (!imu.available()) {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.println("IMU unavailable");
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.println("Original Cardputer");
+    display.println("logs N/A fields");
+  } else {
+    const ImuSample& value = imu.latest();
+    display.setTextColor(value.valid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+    display.printf("%s %s\n", imu.typeName(), value.valid ? "LIVE" : "WAIT");
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.printf("X:%+.2f Y:%+.2f\n", value.ax, value.ay);
+    display.printf("Z:%+.2f G:%.2f\n", value.az, value.gTotal);
+    display.printf("P:%+.1f R:%+.1f\n", value.pitch, value.roll);
+    display.setTextSize(1);
+    display.printf("GYRO  X:%+.1f Y:%+.1f Z:%+.1f", value.gx, value.gy,
+                   value.gz);
+  }
+  drawPageFooter();
+}
+
+void drawGpsSetupPage(uint32_t nowMs) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("GPS SETUP");
+  display.setTextSize(2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setCursor(3, 27);
+  display.printf("Preferred: %s\n", gpsPreferenceName());
+  display.printf("Active: %s\n", activeGps->name());
+  display.printf("Baud: %lu\n", static_cast<unsigned long>(activeGps->baud()));
+  display.setTextColor(activeGps->live(nowMs) ? TFT_GREEN : TFT_ORANGE,
+                       TFT_BLACK);
+  display.printf("Signal: %s\n", activeGps->live(nowMs) ? "NMEA LIVE" : "SCANNING");
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.println("Press G to change");
+  drawPageFooter();
+}
+
+void drawWifiPage() {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("WI-FI");
+  display.setTextSize(2);
+  display.setCursor(3, 27);
+  if (locationTime.wifiConnected()) {
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.println("CONNECTED");
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.println(displayClip(WiFi.SSID(), 18));
+    display.printf("Signal: %ld dBm\n", static_cast<long>(WiFi.RSSI()));
+    display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.println("OFFLINE");
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    const String saved = locationTime.wifiSsid();
+    display.println(saved.isEmpty() ? "No saved network" : displayClip(saved, 18));
+  }
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.println("Press W for setup");
+  drawPageFooter();
+}
+
+void drawLoggerPage(time_t nowUtc) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("LOGGER / SD");
+  display.setTextSize(2);
+  display.setCursor(3, 27);
+  display.setTextColor(sdMounted ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.printf("SD: %s  LOG: ON\n", sdMounted ? "READY" : "RETRY");
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.printf("State: %s\n", modeName(mode));
+  display.printf("Rows: %llu\n", static_cast<unsigned long long>(rowsWritten));
+  if (!currentLogPath.isEmpty()) {
+    const int slash = currentLogPath.lastIndexOf('/');
+    display.println(displayClip(currentLogPath.substring(slash + 1), 19));
+  } else {
+    display.println("Waiting for clock");
+  }
+  if (nextStoppedDueUtc > nowUtc) {
+    display.setTextSize(1);
+    display.printf("Next parked row in %lld min",
+                   static_cast<long long>((nextStoppedDueUtc - nowUtc + 59) / 60));
+  }
+  drawPageFooter();
+}
+
+void drawTimeNetworkPage(time_t nowUtc) {
+  auto& display = M5Cardputer.Display;
+  drawPageTitle("TIME / NETWORK");
+  if (!clockIsReady()) {
+    display.setTextSize(2);
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.drawString("Waiting for time", 8, 42);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.drawString("GPS or Wi-Fi NTP", 8, 72);
+    drawPageFooter();
+    return;
+  }
+
+  struct tm local {};
+  localtime_r(&nowUtc, &local);
+  char clockText[16]{};
+  char dateText[20]{};
+  snprintf(clockText, sizeof(clockText), "%02d:%02d:%02d", local.tm_hour,
+           local.tm_min, local.tm_sec);
+  snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d", local.tm_year + 1900,
+           local.tm_mon + 1, local.tm_mday);
+  display.setTextDatum(middle_center);
+  display.setTextSize(4);
+  display.setTextColor(TFT_GREEN, TFT_BLACK);
+  display.drawString(clockText, display.width() / 2, 48);
+  display.setTextSize(2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString(dateText, display.width() / 2, 80);
+  display.setTextSize(1);
+  const String zone = String(locationTime.zoneName()) + " (" +
+                      locationTime.zoneSource() + ")";
+  display.drawString(displayClip(zone, 36), display.width() / 2, 105);
+  display.setTextDatum(top_left);
+  drawPageFooter();
+}
+
 void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   if (!screenOn || wifiSetup.active()) return;
   if (nowMs - lastDisplayMs < config::kDisplayIntervalMs) return;
@@ -830,47 +1119,51 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   auto& display = M5Cardputer.Display;
   display.startWrite();
   display.fillScreen(TFT_BLACK);
-  display.setCursor(2, 2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.printf("JP226 GPS/IMU  %s\n", boardName());
-  display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  display.printf("GPS: %s  sats:%lu  HDOP:", sample.fixValid ? "FIX" : "NO FIX",
-                 static_cast<unsigned long>(sample.satellites));
-  if (sample.hdopValid) display.printf("%.2f", sample.hdop);
-  else display.print("-");
-  display.println();
-  display.printf("Src:%s %lu %s Pref:%s\n", activeGps->name(),
-                 static_cast<unsigned long>(activeGps->baud()),
-                 activeGps->live(nowMs) ? "OK" : "scan", gpsPreferenceName());
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (sample.positionFresh) {
-    display.printf("Lat:%.6f\nLon:%.6f\n", sample.latitude, sample.longitude);
-  } else {
-    display.println("Lat:-\nLon:-");
+  display.setTextWrap(false);
+  display.setTextDatum(top_left);
+
+  switch (dashboardPage) {
+    case DashboardPage::Combined:
+      drawCombinedPage(sample);
+      break;
+    case DashboardPage::Speed:
+      drawSpeedPage(sample);
+      break;
+    case DashboardPage::HudSpeed:
+      drawHudSpeedPage(sample);
+      break;
+    case DashboardPage::GpsStatus:
+      drawGpsStatusPage(sample, nowMs);
+      break;
+    case DashboardPage::ImuStatus:
+      drawImuStatusPage();
+      break;
+    case DashboardPage::GpsSetup:
+      drawGpsSetupPage(nowMs);
+      break;
+    case DashboardPage::Wifi:
+      drawWifiPage();
+      break;
+    case DashboardPage::Logger:
+      drawLoggerPage(nowUtc);
+      break;
+    case DashboardPage::TimeNetwork:
+      drawTimeNetworkPage(nowUtc);
+      break;
+    default:
+      break;
   }
-  display.printf("Speed: %.1f km/h\n", sample.speedFresh ? sample.speedKmh : 0.0);
-  display.printf("State: %s\n", modeName(mode));
-  display.printf("IMU:%s SD:%s rows:%llu\n", imu.available() ? imu.typeName() : "N/A",
-                 sdMounted ? "OK" : "retry",
-                 static_cast<unsigned long long>(rowsWritten));
-  if (clockIsReady()) {
-    struct tm local {};
-    localtime_r(&nowUtc, &local);
-    display.printf("Local: %04d-%02d-%02d %02d:%02d:%02d\n", local.tm_year + 1900,
-                   local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min,
-                   local.tm_sec);
-  } else {
-    display.println("Clock: waiting for GPS UTC");
-  }
-  display.printf("TZ:%s (%s)\n", locationTime.zoneName(),
-                 locationTime.zoneSource());
-  display.setTextColor(TFT_GREEN, TFT_BLACK);
-  display.print("LOG:ON W:WiFi G:GPS S:screen");
+  display.setTextDatum(top_left);
+  display.setTextSize(1);
   display.endWrite();
 }
 
 void loadPersistentState() {
   preferences.begin("gpsimu", false);
+  const uint8_t savedPage = preferences.getUChar("page", 0);
+  if (savedPage < static_cast<uint8_t>(DashboardPage::Count)) {
+    dashboardPage = static_cast<DashboardPage>(savedPage);
+  }
   const uint8_t savedGpsPreference = preferences.getUChar("gps_src", 0);
   if (savedGpsPreference <= static_cast<uint8_t>(GpsPreference::Cap) &&
       (savedGpsPreference != static_cast<uint8_t>(GpsPreference::Cap) ||
@@ -902,6 +1195,10 @@ void setup() {
   M5Cardputer.Display.fillScreen(TFT_BLACK);
   M5Cardputer.Display.setCursor(2, 2);
   M5Cardputer.Display.println("Starting GPS + IMU logger...");
+
+  hudCanvas.setColorDepth(8);
+  hudCanvasReady = hudCanvas.createSprite(M5Cardputer.Display.width(),
+                                          M5Cardputer.Display.height()) != nullptr;
 
   imu.begin();
   loadPersistentState();

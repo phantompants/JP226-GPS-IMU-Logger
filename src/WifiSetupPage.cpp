@@ -180,17 +180,24 @@ void WifiSetupPage::draw(uint32_t nowMs) {
   auto& display = M5Cardputer.Display;
   display.startWrite();
   display.fillScreen(kBackground);
+  display.setTextDatum(top_left);
+  display.setTextWrap(false);
+  display.setTextSize(2);
   display.setCursor(2, 2);
   display.setTextColor(kAccent, kBackground);
   display.println("Wi-Fi setup");
+  display.drawFastHLine(0, 19, display.width(), kAccent);
+  display.setCursor(2, 23);
   display.setTextColor(kForeground, kBackground);
 
   switch (state_) {
     case State::Scanning:
-      display.println();
-      display.println("Scanning nearby networks...");
-      display.println();
-      display.println("GPS and SD logging continue.");
+      display.println("Scanning nearby");
+      display.println("Wi-Fi networks...");
+      display.setTextColor(kSuccess, kBackground);
+      display.println("Logging continues");
+      display.setTextSize(1);
+      display.setTextColor(kForeground, kBackground);
       display.println("Q: close");
       break;
     case State::Networks:
@@ -213,10 +220,10 @@ void WifiSetupPage::draw(uint32_t nowMs) {
 
 void WifiSetupPage::drawNetworks() {
   auto& display = M5Cardputer.Display;
+  display.setTextSize(2);
   if (networkCount_ == 0) {
-    display.println();
     display.setTextColor(kWarning, kBackground);
-    display.println(resultMessage_);
+    display.println("No networks found");
   } else {
     size_t first = selected_ >= kVisibleNetworks
                        ? selected_ - kVisibleNetworks + 1
@@ -226,56 +233,67 @@ void WifiSetupPage::drawNetworks() {
       if (index >= networkCount_) break;
       display.setTextColor(index == selected_ ? TFT_BLACK : kForeground,
                            index == selected_ ? kAccent : kBackground);
-      display.printf("%c %-22s %4ld %s\n", index == selected_ ? '>' : ' ',
-                     clipped(networks_[index].ssid, 22).c_str(),
-                     static_cast<long>(networks_[index].rssi),
+      display.printf("%c%-16s%s\n", index == selected_ ? '>' : ' ',
+                     clipped(networks_[index].ssid, 16).c_str(),
                      networks_[index].secure ? "*" : " ");
     }
   }
+  display.setTextSize(1);
   display.setTextColor(kForeground, kBackground);
-  display.println("Enter:select  ,/.:move");
-  display.println("R:rescan  Q:close  *=secured");
+  display.println("Enter: select   ,/.: move");
+  display.println("R: rescan  Q: close  *=locked");
 }
 
 void WifiSetupPage::drawPassword() {
   auto& display = M5Cardputer.Display;
-  display.printf("Network: %s\n\n", clipped(networks_[selected_].ssid, 29).c_str());
+  display.setTextSize(2);
+  display.println("Network:");
+  display.println(clipped(networks_[selected_].ssid, 19));
   display.println("Password:");
   String masked;
-  const size_t visible = password_.length() > 30 ? 30 : password_.length();
+  const size_t visible = password_.length() > 16 ? 16 : password_.length();
   for (size_t i = 0; i < visible; ++i) masked += '*';
-  if (password_.length() > visible) masked = "..." + masked;
+  if (password_.length() > visible) masked = ".." + masked;
   display.setTextColor(kAccent, kBackground);
   display.println(masked + "_");
   display.setTextColor(kForeground, kBackground);
-  display.printf("%u/63 characters\n\n",
+  display.setTextSize(1);
+  display.printf("%u/63 chars  Enter: connect\n",
                  static_cast<unsigned>(password_.length()));
-  display.println("Enter: save and connect");
   display.println("Backspace: delete  Fn+`: back");
 }
 
 void WifiSetupPage::drawConnecting() {
   auto& display = M5Cardputer.Display;
-  display.println();
-  display.printf("Connecting to:\n%s\n\n",
-                 clipped(networks_[selected_].ssid, 32).c_str());
-  display.println("GPS and SD logging continue.");
+  display.setTextSize(2);
+  display.println("Connecting to:");
+  display.println(clipped(networks_[selected_].ssid, 19));
+  display.setTextColor(kSuccess, kBackground);
+  display.println("Logging continues");
+  display.setTextSize(1);
+  display.setTextColor(kForeground, kBackground);
   display.println("Q: close");
 }
 
 void WifiSetupPage::drawResult() {
   auto& display = M5Cardputer.Display;
-  display.println();
+  display.setTextSize(2);
   display.setTextColor(WiFi.status() == WL_CONNECTED ? kSuccess : kWarning,
                        kBackground);
-  display.println(resultMessage_);
+  if (WiFi.status() == WL_CONNECTED) display.println("CONNECTED");
+  else display.println("NOT CONNECTED");
   if (WiFi.status() == WL_CONNECTED) {
     display.setTextColor(kForeground, kBackground);
-    display.print("IP: ");
-    display.println(WiFi.localIP());
+    display.println(clipped(WiFi.SSID(), 19));
+    display.setTextSize(1);
+    display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    display.setTextColor(kForeground, kBackground);
+    display.setTextSize(1);
+    display.println("Check password or signal.");
   }
   display.setTextColor(kForeground, kBackground);
-  display.println();
+  display.setTextSize(1);
   display.println("Enter/Q: close  R: scan again");
 }
 

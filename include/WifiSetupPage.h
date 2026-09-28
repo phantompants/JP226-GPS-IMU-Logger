@@ -30,7 +30,7 @@ class WifiSetupPage {
   };
 
   static constexpr size_t kMaxNetworks = 20;
-  static constexpr size_t kVisibleNetworks = 7;
+  static constexpr size_t kVisibleNetworks = 5;
   static constexpr size_t kMaxPasswordLength = 63;
   static constexpr uint32_t kConnectTimeoutMs = 20'000;
 

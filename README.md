@@ -108,10 +108,30 @@ Prebuilt copies from the verified build are in `dist/`.
 
 | Key | Action |
 |---|---|
+| `Tab`, `]` or Fn+right | Next large-text dashboard page |
+| `[` or Fn+left | Previous dashboard page |
+| `1`–`9` | Open a dashboard page directly |
 | `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
 | `W` | Open the Wi-Fi setup page and scan for nearby networks |
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
+
+The selected page is remembered across restarts. The nine pages are:
+
+1. Combined GPS/IMU summary
+2. Large current speed
+3. Horizontally mirrored HUD speed for windscreen reflection
+4. GPS fix, coordinates, satellites, HDOP and receiver status
+5. ADV IMU acceleration, orientation and gyroscope status
+6. GPS source setup and baud/signal status
+7. Wi-Fi connection status and setup shortcut
+8. Logger, SD card, row count, file and parked-schedule status
+9. Large local clock, date and timezone status
+
+The HUD page is intentionally mirrored on the Cardputer screen. Position it
+flat near the windscreen only where it is legal and cannot obstruct the
+driver's view. It is a convenience display, not a calibrated vehicle
+speedometer. GPS speed may lag or be unavailable in tunnels and poor reception.
 
 CSV logging is always enabled and cannot be switched off from the keyboard. If
 the SD card is missing or fails, the logger keeps retrying automatically.
