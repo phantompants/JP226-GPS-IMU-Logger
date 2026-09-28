@@ -39,6 +39,10 @@ void LocationTime::begin(fs::FS& storage, Preferences& preferences) {
     applyTimezone(config::kPosixTimezone, "Australia/Sydney", "DEFAULT", false);
   }
 
+  // Credentials entered on the Cardputer take priority. The SD configuration
+  // remains a convenient first-boot fallback.
+  wifiSsid_ = preferences.getString("wifi_ssid", "");
+  wifiPassword_ = preferences.getString("wifi_pass", "");
   loadConfig(storage);
   if (!configuredTimezone_.isEmpty()) {
     applyTimezone(configuredTimezone_, "Configured", "CONFIG", false);
@@ -55,6 +59,9 @@ void LocationTime::loadConfig(fs::FS& storage) {
   File file = storage.open(config::kLoggerConfigPath, FILE_READ);
   if (!file) return;
 
+  String fileWifiSsid;
+  String fileWifiPassword;
+
   while (file.available()) {
     String line = file.readStringUntil('\n');
     line.trim();
@@ -70,9 +77,9 @@ void LocationTime::loadConfig(fs::FS& storage) {
     key.toLowerCase();
 
     if (key == "wifi_ssid") {
-      wifiSsid_ = value;
+      fileWifiSsid = value;
     } else if (key == "wifi_password") {
-      wifiPassword_ = value;
+      fileWifiPassword = value;
     } else if (key == "timezone") {
       configuredTimezone_ = value;
     } else if (key == "timezone_auto") {
@@ -80,6 +87,11 @@ void LocationTime::loadConfig(fs::FS& storage) {
     }
   }
   file.close();
+
+  if (wifiSsid_.isEmpty() && !fileWifiSsid.isEmpty()) {
+    wifiSsid_ = fileWifiSsid;
+    wifiPassword_ = fileWifiPassword;
+  }
 }
 
 void LocationTime::startWifi(uint32_t nowMs) {
@@ -95,6 +107,23 @@ void LocationTime::startWifi(uint32_t nowMs) {
 
 bool LocationTime::wifiConnected() const {
   return WiFi.status() == WL_CONNECTED;
+}
+
+void LocationTime::setWifiCredentials(const String& ssid,
+                                      const String& password) {
+  if (ssid.isEmpty()) return;
+  wifiSsid_ = ssid;
+  wifiPassword_ = password;
+  if (preferences_ != nullptr) {
+    preferences_->putString("wifi_ssid", wifiSsid_);
+    preferences_->putString("wifi_pass", wifiPassword_);
+  }
+
+  WiFi.disconnect(false, false);
+  wifiStarted_ = false;
+  startWifi(millis());
+  configTime(0, 0, config::kNtpServer1, config::kNtpServer2,
+             config::kNtpServer3);
 }
 
 void LocationTime::update(double latitude, double longitude, bool locationFresh,

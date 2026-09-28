@@ -15,6 +15,7 @@
 #include "Config.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
+#include "WifiSetupPage.h"
 
 namespace {
 
@@ -266,6 +267,7 @@ SPIClass sdSpi(FSPI);
 Preferences preferences;
 ImuSampler imu;
 LocationTime locationTime;
+WifiSetupPage wifiSetup;
 File logFile;
 String currentLogPath;
 
@@ -772,6 +774,12 @@ void cycleGpsPreference() {
 }
 
 void handleControls() {
+  if (wifiSetup.active()) {
+    wifiSetup.handleInput(locationTime);
+    if (!wifiSetup.active()) lastDisplayMs = 0;
+    return;
+  }
+
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
     return;
   }
@@ -787,6 +795,13 @@ void handleControls() {
     }
   } else if (M5Cardputer.Keyboard.isKeyPressed('g')) {
     cycleGpsPreference();
+  } else if (M5Cardputer.Keyboard.isKeyPressed('w')) {
+    if (!screenOn) {
+      screenOn = true;
+      M5Cardputer.Display.wakeup();
+      M5Cardputer.Display.setBrightness(displayBrightness);
+    }
+    wifiSetup.open();
   } else if (M5Cardputer.Keyboard.isKeyPressed('-')) {
     displayBrightness = displayBrightness >= 30 ? displayBrightness - 30 : 0;
     if (screenOn) M5Cardputer.Display.setBrightness(displayBrightness);
@@ -808,7 +823,7 @@ const char* boardName() {
 }
 
 void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
-  if (!screenOn) return;
+  if (!screenOn || wifiSetup.active()) return;
   if (nowMs - lastDisplayMs < config::kDisplayIntervalMs) return;
   lastDisplayMs = nowMs;
 
@@ -850,7 +865,7 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   display.printf("TZ:%s (%s)\n", locationTime.zoneName(),
                  locationTime.zoneSource());
   display.setTextColor(TFT_GREEN, TFT_BLACK);
-  display.print("LOG:ON G:GPS S:screen -/+:bright");
+  display.print("LOG:ON W:WiFi G:GPS S:screen");
   display.endWrite();
 }
 
@@ -920,6 +935,7 @@ void loop() {
   const GpsSnapshot gpsSample = takeGpsSnapshot(*activeGps);
   locationTime.update(gpsSample.latitude, gpsSample.longitude,
                       gpsSample.positionFresh, gpsSample.speedKmh, nowMs);
+  wifiSetup.update(nowMs);
   syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
@@ -935,5 +951,6 @@ void loop() {
     locationTimeStarted = true;
   }
   drawStatus(gpsSample, nowMs, nowUtc);
+  wifiSetup.draw(nowMs);
   delay(2);
 }

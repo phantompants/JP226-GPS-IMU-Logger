@@ -9,9 +9,11 @@ class LocationTime {
   void begin(fs::FS& storage, Preferences& preferences);
   void update(double latitude, double longitude, bool locationFresh,
               double speedKmh, uint32_t nowMs);
+  void setWifiCredentials(const String& ssid, const String& password);
 
   const char* zoneName() const { return zoneName_.c_str(); }
   const char* zoneSource() const { return zoneSource_.c_str(); }
+  const char* wifiSsid() const { return wifiSsid_.c_str(); }
   bool wifiConnected() const;
 
  private:

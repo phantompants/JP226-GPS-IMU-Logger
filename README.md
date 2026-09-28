@@ -109,6 +109,7 @@ Prebuilt copies from the verified build are in `dist/`.
 | Key | Action |
 |---|---|
 | `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
+| `W` | Open the Wi-Fi setup page and scan for nearby networks |
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
 
@@ -166,9 +167,23 @@ DST rules. Elsewhere it uses the service's current UTC offset and refreshes it
 every six hours when stopped and online. If automatic location lookup is not
 wanted, set `timezone_auto=false` and provide a POSIX `timezone=` rule.
 
-### Optional Starlink/Wi-Fi configuration
+### Starlink/Wi-Fi setup
 
-Copy `logger.cfg.example` to `/telemetry/logger.cfg` on the logging microSD card,
+Press `W` on the logger screen to open the built-in Wi-Fi setup page. It scans
+for nearby networks without stopping GPS or SD logging. Use Fn+up/down or the
+`,`/`.` keys to move, press Enter to select a network, type its password, then
+press Enter again to save and connect. Use `R` to rescan and `Q` to close the
+page. Fn+backtick acts as Escape/back while entering a password.
+
+Credentials entered on the device are stored in ESP32 non-volatile storage and
+reused after restarts. The password is masked on screen. Like most ESP32
+applications, NVS is not encrypted unless flash encryption has separately been
+enabled, so physical access to the device should be treated as access to its
+saved credentials.
+
+The SD configuration method remains available as an optional first-boot or
+recovery method. On-device saved credentials take priority. Copy
+`logger.cfg.example` to `/telemetry/logger.cfg` on the logging microSD card,
 then edit it:
 
 ```ini
