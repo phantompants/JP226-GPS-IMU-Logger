@@ -121,12 +121,18 @@ The selected page is remembered across restarts. The nine pages are:
 1. Combined GPS/IMU summary
 2. Large current speed
 3. Horizontally mirrored HUD speed for windscreen reflection
-4. GPS fix, coordinates, satellites, HDOP and receiver status
+4. GPS fix, coordinates, satellites, HDOP, receiver and timezone status
 5. ADV IMU acceleration, orientation and gyroscope status
 6. GPS source setup and baud/signal status
 7. Wi-Fi connection status and setup shortcut
 8. Logger, SD card, row count, file and parked-schedule status
 9. Large local clock, date and timezone status
+
+Dashboard and Wi-Fi setup frames are drawn off-screen and transferred to the
+LCD in one operation to prevent visible clearing/flicker. Wi-Fi results use
+large `ENTER/Q: QUIT` and `R: START AGAIN` actions. The HUD digits are rendered
+directly as mirrored seven-segment shapes, which works on both the original
+Cardputer and Cardputer ADV without relying on display scaling support.
 
 The HUD page is intentionally mirrored on the Cardputer screen. Position it
 flat near the windscreen only where it is legal and cannot obstruct the

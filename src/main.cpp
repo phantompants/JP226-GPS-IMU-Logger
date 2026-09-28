@@ -283,7 +283,7 @@ Preferences preferences;
 ImuSampler imu;
 LocationTime locationTime;
 WifiSetupPage wifiSetup;
-M5Canvas hudCanvas(&M5Cardputer.Display);
+M5Canvas dashboardCanvas(&M5Cardputer.Display);
 File logFile;
 String currentLogPath;
 
@@ -314,7 +314,7 @@ time_t persistedNextDueUtc = 0;
 LogMode mode = LogMode::WaitingForFix;
 GpsPreference gpsPreference = GpsPreference::Auto;
 DashboardPage dashboardPage = DashboardPage::Combined;
-bool hudCanvasReady = false;
+bool dashboardCanvasReady = false;
 
 int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
@@ -874,7 +874,7 @@ String displayClip(const String& value, size_t maximum) {
 }
 
 void drawPageTitle(const char* title, uint16_t color = TFT_CYAN) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   display.setTextDatum(top_left);
   display.setTextSize(2);
   display.setTextColor(color, TFT_BLACK);
@@ -883,7 +883,7 @@ void drawPageTitle(const char* title, uint16_t color = TFT_CYAN) {
 }
 
 void drawPageFooter(const char* hint = "[ ]/Tab: pages") {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   display.setTextDatum(bottom_left);
   display.setTextSize(1);
   display.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -896,7 +896,7 @@ void drawPageFooter(const char* hint = "[ ]/Tab: pages") {
 }
 
 void drawCombinedPage(const GpsSnapshot& sample) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("GPS + IMU");
   char speed[24]{};
   snprintf(speed, sizeof(speed), sample.speedFresh ? "%.1f km/h" : "-- km/h",
@@ -918,7 +918,7 @@ void drawCombinedPage(const GpsSnapshot& sample) {
 }
 
 void drawSpeedPage(const GpsSnapshot& sample) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("SPEED");
   char speed[16]{};
   snprintf(speed, sizeof(speed), sample.speedFresh ? "%.1f" : "--",
@@ -933,38 +933,78 @@ void drawSpeedPage(const GpsSnapshot& sample) {
   drawPageFooter();
 }
 
+void drawMirroredSevenSegmentDigit(M5Canvas& display, char character, int x,
+                                   int y, int width, int height, int thickness,
+                                   uint16_t color) {
+  constexpr uint8_t digitSegments[10] = {
+      0x3F, 0x06, 0x5B, 0x4F, 0x66,
+      0x6D, 0x7D, 0x07, 0x7F, 0x6F,
+  };
+  uint8_t segments = character == '-' ? 0x40 :
+                     (character >= '0' && character <= '9'
+                          ? digitSegments[character - '0']
+                          : 0);
+
+  auto mirroredRect = [&](int offsetX, int offsetY, int rectWidth,
+                          int rectHeight) {
+    display.fillRect(x + width - offsetX - rectWidth, y + offsetY, rectWidth,
+                     rectHeight, color);
+  };
+  const int half = height / 2;
+  if (segments & 0x01) mirroredRect(thickness, 0, width - 2 * thickness, thickness);
+  if (segments & 0x02) mirroredRect(width - thickness, thickness, thickness,
+                                    half - thickness);
+  if (segments & 0x04) mirroredRect(width - thickness, half, thickness,
+                                    half - thickness);
+  if (segments & 0x08) mirroredRect(thickness, height - thickness,
+                                    width - 2 * thickness, thickness);
+  if (segments & 0x10) mirroredRect(0, half, thickness, half - thickness);
+  if (segments & 0x20) mirroredRect(0, thickness, thickness, half - thickness);
+  if (segments & 0x40) mirroredRect(thickness, half - thickness / 2,
+                                    width - 2 * thickness, thickness);
+}
+
 void drawHudSpeedPage(const GpsSnapshot& sample) {
-  auto& display = M5Cardputer.Display;
-  if (!hudCanvasReady) {
-    drawPageTitle("HUD unavailable", TFT_ORANGE);
-    display.setTextSize(2);
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.drawString("Not enough memory", 8, 48);
-    drawPageFooter();
-    return;
+  auto& display = dashboardCanvas;
+  char speed[8]{};
+  if (sample.speedFresh) {
+    const int roundedSpeed = static_cast<int>(std::round(sample.speedKmh));
+    snprintf(speed, sizeof(speed), "%d",
+             roundedSpeed < 0 ? 0 : (roundedSpeed > 999 ? 999 : roundedSpeed));
+  } else {
+    strcpy(speed, "--");
   }
 
-  char speed[16]{};
-  snprintf(speed, sizeof(speed), sample.speedFresh ? "%.0f" : "--",
-           sample.speedKmh);
-  hudCanvas.fillScreen(TFT_BLACK);
-  hudCanvas.setTextDatum(middle_center);
-  hudCanvas.setTextSize(7);
-  hudCanvas.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  hudCanvas.drawString(speed, hudCanvas.width() / 2, 54);
-  hudCanvas.setTextSize(3);
-  hudCanvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  hudCanvas.drawString("km/h", hudCanvas.width() / 2, 108);
-  hudCanvas.setTextSize(1);
-  hudCanvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  hudCanvas.drawString("HUD  [ ] change page", hudCanvas.width() / 2, 128);
-  hudCanvas.setPivot(hudCanvas.width() / 2, hudCanvas.height() / 2);
-  hudCanvas.pushRotateZoom(display.width() / 2, display.height() / 2, 0.0f,
-                           -1.0f, 1.0f);
+  constexpr int digitWidth = 52;
+  constexpr int digitHeight = 94;
+  constexpr int digitSpacing = 8;
+  constexpr int digitTop = 7;
+  const int length = strlen(speed);
+  const int totalWidth = length * digitWidth + (length - 1) * digitSpacing;
+  const int normalStart = (display.width() - totalWidth) / 2;
+  const uint16_t color = sample.fixValid ? TFT_GREEN : TFT_ORANGE;
+
+  // Draw the entire number as a horizontal mirror. In the windscreen
+  // reflection it appears in the normal reading direction. This avoids the
+  // negative-scale sprite operation that is unreliable on original hardware.
+  for (int index = 0; index < length; ++index) {
+    const int normalX = normalStart + index * (digitWidth + digitSpacing);
+    const int mirroredX = display.width() - normalX - digitWidth;
+    drawMirroredSevenSegmentDigit(display, speed[index], mirroredX, digitTop,
+                                  digitWidth, digitHeight, 8, color);
+  }
+  display.setTextDatum(bottom_center);
+  display.setTextSize(2);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString("MIRRORED HUD", display.width() / 2, 122);
+  display.setTextDatum(top_left);
+  display.setTextSize(1);
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.drawString("[ ] / Tab changes page", 2, 126);
 }
 
 void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("GPS STATUS");
   display.setTextSize(2);
   display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
@@ -981,11 +1021,13 @@ void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
                  activeGps->live(nowMs) ? "LIVE" : "SCAN");
   if (sample.hdopValid) display.printf("%.1f", sample.hdop);
   else display.print("--");
+  display.println();
+  display.printf("TZ:%s", displayClip(locationTime.zoneName(), 17).c_str());
   drawPageFooter();
 }
 
 void drawImuStatusPage() {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("IMU STATUS");
   display.setTextSize(2);
   display.setCursor(3, 27);
@@ -1011,7 +1053,7 @@ void drawImuStatusPage() {
 }
 
 void drawGpsSetupPage(uint32_t nowMs) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("GPS SETUP");
   display.setTextSize(2);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1028,7 +1070,7 @@ void drawGpsSetupPage(uint32_t nowMs) {
 }
 
 void drawWifiPage() {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("WI-FI");
   display.setTextSize(2);
   display.setCursor(3, 27);
@@ -1052,7 +1094,7 @@ void drawWifiPage() {
 }
 
 void drawLoggerPage(time_t nowUtc) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("LOGGER / SD");
   display.setTextSize(2);
   display.setCursor(3, 27);
@@ -1076,7 +1118,7 @@ void drawLoggerPage(time_t nowUtc) {
 }
 
 void drawTimeNetworkPage(time_t nowUtc) {
-  auto& display = M5Cardputer.Display;
+  auto& display = dashboardCanvas;
   drawPageTitle("TIME / NETWORK");
   if (!clockIsReady()) {
     display.setTextSize(2);
@@ -1116,7 +1158,18 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   if (nowMs - lastDisplayMs < config::kDisplayIntervalMs) return;
   lastDisplayMs = nowMs;
 
-  auto& display = M5Cardputer.Display;
+  if (!dashboardCanvasReady) {
+    auto& physicalDisplay = M5Cardputer.Display;
+    physicalDisplay.fillScreen(TFT_BLACK);
+    physicalDisplay.setTextSize(2);
+    physicalDisplay.setTextColor(TFT_ORANGE, TFT_BLACK);
+    physicalDisplay.setCursor(4, 35);
+    physicalDisplay.println("Display buffer");
+    physicalDisplay.println("unavailable");
+    return;
+  }
+
+  auto& display = dashboardCanvas;
   display.startWrite();
   display.fillScreen(TFT_BLACK);
   display.setTextWrap(false);
@@ -1156,6 +1209,7 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   display.setTextDatum(top_left);
   display.setTextSize(1);
   display.endWrite();
+  display.pushSprite(0, 0);
 }
 
 void loadPersistentState() {
@@ -1196,9 +1250,11 @@ void setup() {
   M5Cardputer.Display.setCursor(2, 2);
   M5Cardputer.Display.println("Starting GPS + IMU logger...");
 
-  hudCanvas.setColorDepth(8);
-  hudCanvasReady = hudCanvas.createSprite(M5Cardputer.Display.width(),
-                                          M5Cardputer.Display.height()) != nullptr;
+  dashboardCanvas.setColorDepth(8);
+  dashboardCanvasReady =
+      dashboardCanvas.createSprite(M5Cardputer.Display.width(),
+                                   M5Cardputer.Display.height()) != nullptr;
+  if (dashboardCanvasReady) wifiSetup.setCanvas(dashboardCanvas);
 
   imu.begin();
   loadPersistentState();
