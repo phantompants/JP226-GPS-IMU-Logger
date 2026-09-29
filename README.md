@@ -222,11 +222,11 @@ timezone_auto=true
 # timezone=AEST-10AEDT,M10.1.0,M4.1.0/3
 ```
 
-The logger never requires Wi-Fi to record. Wi-Fi is used only for NTP and the
-optional coordinate-to-timezone lookup. The configuration file stores the
-Wi-Fi password as plain text on the SD card, so keep the card private. Automatic
-timezone lookup sends the current GPS coordinates to `timeapi.io`; set
-`timezone_auto=false` to disable this.
+The logger never requires Wi-Fi to record. Wi-Fi is used for NTP, the optional
+coordinate-to-timezone lookup, and the local file portal described below. The
+configuration file stores the Wi-Fi password as plain text on the SD card, so
+keep the card private. Automatic timezone lookup sends the current GPS
+coordinates to `timeapi.io`; set `timezone_auto=false` to disable this.
 
 On the ADV, M5Unified restores system UTC from the onboard RTC at boot. A fresh
 GPS or NTP time periodically corrects that RTC. The original Cardputer has no
@@ -236,6 +236,43 @@ a file; this prevents wrongly dated files.
 Each append is flushed immediately. If the SD card is missing or an append
 fails, the logger closes the file and retries the card every 10 seconds. An
 existing daily file is appended to and does not receive a second header.
+
+## iPhone and iPad file portal
+
+When the Cardputer is connected to Wi-Fi, it serves a responsive local web page
+designed for an iPhone 16 Pro Max and a 12.9-inch iPad Pro. Join the phone or
+tablet to the same travel-router network, then open:
+
+```text
+http://jp226-logger.local
+```
+
+The Wi-Fi dashboard page also shows this address. If the router blocks mDNS or
+multicast discovery, use the numeric IP address shown on that page instead, for
+example `http://192.168.1.42`.
+
+The portal provides:
+
+- large, touch-friendly GPS, logging, SD and KML status cards;
+- the latest speed, local clock, timezone and connected Wi-Fi network;
+- a newest-first list of daily CSV and KML files on the microSD card;
+- direct CSV/KML download buttons; and
+- a button to rescan completed CSV days for missing KML files.
+
+The file portal is deliberately read-only: it cannot upload, rename or delete
+files. Downloads are accepted only after the logger has positively entered
+`STOPPED_15M` or `STOPPED_HOURLY`. This prevents a large synchronous SD/network
+transfer from delaying NMEA processing while driving. If KML conversion is
+requested while moving, the request remains queued and starts automatically
+after the vehicle is confirmed stopped. Movement resuming pauses conversion
+immediately and it resumes after the vehicle is stopped again. If power is lost,
+an incomplete `.tmp` export is discarded and rebuilt on a later stopped scan.
+
+This is a local-network interface, not a cloud service, and it does not need
+working Starlink Internet once the devices are connected to the same router.
+It has no login, so use it only on a trusted travel-router network. Do not add a
+public Internet port-forward to the Cardputer. A properly configured VPN is the
+safer option if access is ever needed from outside the vehicle network.
 
 ## Google Earth and Google Maps KML export
 
@@ -251,12 +288,13 @@ conversion, and continues logging to the new date. On every boot it also scans
 for older CSV files that do not yet have a KML. Press `K` at any time to open
 page 10 and run that scan manually.
 
-Conversion is streamed a few CSV rows at a time so a large file is never loaded
-into RAM and GPS reception continues in the background. Only valid latitude and
-longitude rows are included. Current 26-column logs require `fix_valid=1`;
-older compatible logs without that column are accepted when their `lat` and
-`lon` values are valid. The route is stored as a ground-clamped KML
-`LineString`, using the required `longitude,latitude,altitude` coordinate order.
+Conversion runs only while the vehicle is confirmed stopped. It is streamed a
+few CSV rows at a time so a large file is never loaded into RAM, and it pauses
+as soon as movement resumes. Only valid latitude and longitude rows are
+included. Current 26-column logs require `fix_valid=1`; older compatible logs
+without that column are accepted when their `lat` and `lon` values are valid.
+The route is stored as a ground-clamped KML `LineString`, using the required
+`longitude,latitude,altitude` coordinate order.
 
 The exporter writes a `.tmp` file first and renames it only after the complete
 KML is safely closed. A restart or power loss therefore cannot leave a partial
@@ -315,6 +353,7 @@ All user-tunable constants are in `include/Config.h`. The main ones are:
 | `kGpsSourceStaleMs` | 5 s | Source failover/detection timeout |
 | `kTimezoneLookupIntervalMs` | 6 h | Online location-timezone refresh interval |
 | `kTimezoneLookupRetryMs` | 15 min | Retry delay after an unavailable lookup |
+| `kWebHostname` | `jp226-logger` | Local mDNS hostname for the file portal |
 | `kMoveStartKmh` | 3.0 km/h | Immediate moving threshold |
 | `kMoveStopKmh` | 1.5 km/h | Candidate stopped threshold |
 | `kStopConfirmMs` | 10 s | Low-speed dwell before stopped |
@@ -374,9 +413,11 @@ include/Config.h          hardware pins, thresholds and intervals
 include/KmlExporter.h     restart-safe streaming KML export interface
 include/LocationTime.h    Wi-Fi/NTP/location-timezone interface
 include/LogSchedule.h     pure stopped-schedule interface
+include/WebPortal.h       responsive read-only CSV/KML portal interface
 src/LocationTime.cpp      optional network time and timezone implementation
 src/KmlExporter.cpp       daily CSV discovery and Google KML generation
 src/LogSchedule.cpp       15-minute/hourly boundary calculations
+src/WebPortal.cpp         local status, file listing and download web server
 src/main.cpp              GPS, IMU, clock, NVS, SD, CSV and display logic
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests

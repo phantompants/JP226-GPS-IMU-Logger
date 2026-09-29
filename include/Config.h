@@ -78,6 +78,7 @@ constexpr char kFilePrefix[] = "telemetry_";
 constexpr char kKmlDirectory[] = "/telemetry/kml";
 constexpr uint16_t kKmlLinesPerUpdate = 12;
 constexpr uint16_t kKmlFlushEveryPoints = 128;
+constexpr char kWebHostname[] = "jp226-logger";
 
 }  // namespace config
 

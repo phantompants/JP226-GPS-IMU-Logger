@@ -17,6 +17,7 @@
 #include "KmlExporter.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
+#include "WebPortal.h"
 #include "WifiSetupPage.h"
 
 namespace {
@@ -285,6 +286,7 @@ Preferences preferences;
 ImuSampler imu;
 LocationTime locationTime;
 KmlExporter kmlExporter;
+WebPortal webPortal;
 WifiSetupPage wifiSetup;
 M5Canvas dashboardCanvas(&M5Cardputer.Display);
 File logFile;
@@ -732,6 +734,10 @@ bool logIsDue(uint32_t nowMs, time_t nowUtc) {
   }
 }
 
+bool stationaryForFileWork() {
+  return mode == LogMode::StoppedFirstHour || mode == LogMode::StoppedHourly;
+}
+
 void onLogSucceeded(uint32_t nowMs, time_t nowUtc) {
   immediateLogRequested = false;
   lastLogMs = nowMs;
@@ -1116,6 +1122,10 @@ void drawWifiPage() {
     display.println(displayClip(WiFi.SSID(), 18));
     display.printf("Signal: %ld dBm\n", static_cast<long>(WiFi.RSSI()));
     display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    display.setTextSize(1);
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.println("jp226-logger.local");
+    display.setTextSize(2);
   } else {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
     display.println("OFFLINE");
@@ -1193,9 +1203,12 @@ void drawKmlExportPage() {
   drawPageTitle("KML EXPORT");
   display.setTextSize(2);
   display.setCursor(3, 25);
-  display.setTextColor(kmlExporter.failedCount() == 0 ? TFT_GREEN : TFT_ORANGE,
+  const bool stationary = stationaryForFileWork();
+  display.setTextColor(kmlExporter.failedCount() == 0 && stationary
+                           ? TFT_GREEN
+                           : TFT_ORANGE,
                        TFT_BLACK);
-  display.printf("%s\n", kmlExporter.phaseName());
+  display.printf("%s\n", stationary ? kmlExporter.phaseName() : "WAITING TO STOP");
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.printf("Done:%u  Err:%u\n", kmlExporter.completedCount(),
                  kmlExporter.failedCount());
@@ -1322,6 +1335,8 @@ void setup() {
   loadPersistentState();
   kmlExporter.begin(SD, config::kLogDirectory, config::kFilePrefix,
                     config::kKmlDirectory);
+  webPortal.begin(SD, config::kLogDirectory, config::kKmlDirectory,
+                  config::kWebHostname);
 
   groveBaudIndex = 0;
   groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
@@ -1376,8 +1391,27 @@ void loop() {
       lastKmlScanDate = currentDate;
       kmlExporter.requestScan();
     }
-    kmlExporter.update(currentLogPath, currentDate);
+    if (webPortal.takeConversionRequest()) kmlExporter.requestScan();
+    if (stationaryForFileWork()) {
+      kmlExporter.update(currentLogPath, currentDate);
+    }
   }
+
+  WebPortalStatus webStatus;
+  webStatus.sdMounted = sdMounted;
+  webStatus.stationary = stationaryForFileWork();
+  webStatus.fixValid = gpsSample.fixValid;
+  webStatus.speedKmh = gpsSample.speedFresh ? gpsSample.speedKmh : 0.0;
+  webStatus.logState = modeName(mode);
+  webStatus.activeCsvPath = currentLogPath;
+  webStatus.timezone = locationTime.zoneName();
+  webStatus.kmlPhase = kmlExporter.phaseName();
+  webStatus.kmlMessage = kmlExporter.lastMessage();
+  webStatus.kmlQueued = kmlExporter.queuedCount();
+  webStatus.kmlCompleted = kmlExporter.completedCount();
+  webStatus.kmlFailed = kmlExporter.failedCount();
+  webStatus.kmlPoints = kmlExporter.pointsWritten();
+  webPortal.update(webStatus);
   drawStatus(gpsSample, nowMs, nowUtc);
   wifiSetup.draw(nowMs);
   delay(2);
