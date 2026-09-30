@@ -11,3 +11,8 @@ timezone_auto=true
 # Optional POSIX timezone fallback/override. Leave blank to use the saved zone
 # or the firmware default (Australia/Sydney).
 # timezone=AEST-10AEDT,M10.1.0,M4.1.0/3
+
+# Optional Nominatim-compatible reverse-geocoding endpoint. Leave commented
+# for fully offline operation. Use a service you operate or are authorized to
+# query; the public OSM Nominatim endpoint is not configured by default.
+# place_lookup_url=https://your-geocoder.example/reverse

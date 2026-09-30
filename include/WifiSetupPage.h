@@ -53,7 +53,8 @@ class WifiSetupPage {
   String password_;
   String resultMessage_;
   uint32_t connectStartedMs_ = 0;
-  uint32_t lastDrawMs_ = 0;
+  uint32_t lastFrameHash_ = 0;
+  bool haveFrameHash_ = false;
   bool dirty_ = false;
   M5Canvas* canvas_ = nullptr;
 };

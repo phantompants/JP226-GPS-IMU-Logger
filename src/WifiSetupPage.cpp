@@ -19,6 +19,17 @@ String clipped(const String& value, size_t maximum) {
   return value.substring(0, maximum - 3) + "...";
 }
 
+uint32_t frameBufferHash(const M5Canvas& canvas) {
+  const auto* bytes = static_cast<const uint8_t*>(canvas.getBuffer());
+  const size_t length = canvas.bufferLength();
+  uint32_t hash = 2166136261U;
+  for (size_t index = 0; index < length; ++index) {
+    hash ^= bytes[index];
+    hash *= 16777619U;
+  }
+  return hash;
+}
+
 }  // namespace
 
 void WifiSetupPage::open() {
@@ -33,6 +44,7 @@ void WifiSetupPage::startScan() {
   selected_ = 0;
   state_ = State::Scanning;
   resultMessage_ = "Scanning for Wi-Fi...";
+  haveFrameHash_ = false;
   WiFi.scanNetworks(true, true);
   markDirty();
 }
@@ -173,10 +185,9 @@ void WifiSetupPage::update(uint32_t nowMs) {
 }
 
 void WifiSetupPage::draw(uint32_t nowMs) {
-  if (!active() || canvas_ == nullptr ||
-      (!dirty_ && nowMs - lastDrawMs_ < 500)) return;
+  (void)nowMs;
+  if (!active() || canvas_ == nullptr || !dirty_) return;
   dirty_ = false;
-  lastDrawMs_ = nowMs;
 
   auto& display = *canvas_;
   display.startWrite();
@@ -217,7 +228,12 @@ void WifiSetupPage::draw(uint32_t nowMs) {
       break;
   }
   display.endWrite();
-  display.pushSprite(0, 0);
+  const uint32_t frameHash = frameBufferHash(display);
+  if (!haveFrameHash_ || frameHash != lastFrameHash_) {
+    display.pushSprite(0, 0);
+    lastFrameHash_ = frameHash;
+    haveFrameHash_ = true;
+  }
 }
 
 void WifiSetupPage::drawNetworks() {
@@ -289,7 +305,10 @@ void WifiSetupPage::drawResult() {
     display.setTextColor(kForeground, kBackground);
     display.println(clipped(WiFi.SSID(), 19));
     display.setTextSize(1);
-    display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    const String ip = WiFi.localIP().toString();
+    display.printf("IP: %s\n", ip.c_str());
+    display.printf("WEB: http://%s/\n", ip.c_str());
+    display.println("PORT: 80");
   } else {
     display.setTextColor(kForeground, kBackground);
     display.setTextSize(1);
@@ -305,10 +324,10 @@ void WifiSetupPage::close() {
   WiFi.scanDelete();
   password_ = "";
   state_ = State::Closed;
+  haveFrameHash_ = false;
   dirty_ = false;
 }
 
 void WifiSetupPage::markDirty() {
   dirty_ = true;
-  lastDrawMs_ = 0;
 }

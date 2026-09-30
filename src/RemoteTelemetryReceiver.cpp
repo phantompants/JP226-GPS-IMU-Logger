@@ -1,0 +1,400 @@
+#include "RemoteTelemetryReceiver.h"
+
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+#include "Config.h"
+
+RemoteTelemetryReceiver* RemoteTelemetryReceiver::instance_ = nullptr;
+
+namespace {
+
+constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF,
+                                      0xFF, 0xFF, 0xFF};
+
+uint32_t saturatedAdd(uint32_t left, uint32_t right) {
+  return UINT32_MAX - left < right ? UINT32_MAX : left + right;
+}
+
+}  // namespace
+
+bool RemoteTelemetryReceiver::begin(const uint8_t allowedMac[6]) {
+  std::memcpy(allowedMac_, allowedMac, sizeof(allowedMac_));
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    ready_ = false;
+    return false;
+  }
+
+  instance_ = this;
+  if (esp_now_register_recv_cb(receiveCallback) != ESP_OK) {
+    esp_now_deinit();
+    instance_ = nullptr;
+    ready_ = false;
+    return false;
+  }
+
+  esp_now_peer_info_t broadcast{};
+  std::memcpy(broadcast.peer_addr, kBroadcastMac, sizeof(kBroadcastMac));
+  broadcast.channel = 0;
+  broadcast.ifidx = WIFI_IF_STA;
+  broadcast.encrypt = false;
+  const esp_err_t peerResult = esp_now_add_peer(&broadcast);
+  ready_ = peerResult == ESP_OK || peerResult == ESP_ERR_ESPNOW_EXIST;
+  return ready_;
+}
+
+void RemoteTelemetryReceiver::receiveCallback(const esp_now_recv_info_t* info,
+                                              const uint8_t* data, int length) {
+  if (instance_ != nullptr) instance_->receive(info, data, length);
+}
+
+bool RemoteTelemetryReceiver::sourceAllowed(const uint8_t* mac) const {
+  if (!telemetry::macIsUnset(allowedMac_)) {
+    return std::memcmp(mac, allowedMac_, sizeof(allowedMac_)) == 0;
+  }
+  // Discovery mode locks to the first node heard, but accepts a replacement
+  // once that node has gone stale.
+  const uint32_t nowMs = millis();
+  portENTER_CRITICAL(&mux_);
+  const bool allowed =
+      !havePeer_ || std::memcmp(mac, peerMac_, sizeof(peerMac_)) == 0 ||
+      nowMs - lastPacketMs_ > config::kRemoteStaleMs;
+  portEXIT_CRITICAL(&mux_);
+  return allowed;
+}
+
+void RemoteTelemetryReceiver::receive(const esp_now_recv_info_t* info,
+                                      const uint8_t* data, int length) {
+  if (info == nullptr || info->src_addr == nullptr || data == nullptr ||
+      length < static_cast<int>(sizeof(telemetry::PacketHeader))) {
+    return;
+  }
+
+  telemetry::PacketHeader header{};
+  std::memcpy(&header, data, sizeof(header));
+  if (header.magic != telemetry::kMagic ||
+      header.version != telemetry::kProtocolVersion) {
+    portENTER_CRITICAL(&mux_);
+    ++versionErrors_;
+    portEXIT_CRITICAL(&mux_);
+    return;
+  }
+  if (header.size != length) return;
+
+  const auto type = static_cast<telemetry::PacketType>(header.type);
+  if (type == telemetry::PacketType::DialCommand &&
+      length == static_cast<int>(sizeof(telemetry::DialCommandPacket))) {
+    telemetry::DialCommandPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (!telemetry::validatePacket(packet, telemetry::PacketType::DialCommand))
+      return;
+    if (!telemetry::macIsUnset(config::kDialEspNowMac) &&
+        std::memcmp(info->src_addr, config::kDialEspNowMac, 6) != 0) return;
+    portENTER_CRITICAL(&mux_);
+    if (!haveDial_ || std::memcmp(info->src_addr, dialMac_, 6) == 0) {
+      if (!haveDial_) std::memcpy(dialMac_, info->src_addr, 6);
+      haveDial_ = true;
+      lastDialMs_ = millis();
+      if (packet.action !=
+          static_cast<uint8_t>(telemetry::DialAction::Heartbeat)) {
+        if (haveDialCommandSequence_ &&
+            packet.sequence == lastDialCommandSequence_) {
+          dialAckRepeatPending_ = haveDialAck_;
+        } else {
+          lastDialCommandSequence_ = packet.sequence;
+          haveDialCommandSequence_ = true;
+          dialCommand_ = packet;
+          dialCommandReady_ = true;
+        }
+      }
+    }
+    portEXIT_CRITICAL(&mux_);
+    return;
+  }
+  if (!sourceAllowed(info->src_addr)) return;
+  if (type == telemetry::PacketType::Telemetry &&
+      length == static_cast<int>(sizeof(telemetry::TelemetryPacket))) {
+    telemetry::TelemetryPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (!telemetry::validatePacket(packet, telemetry::PacketType::Telemetry)) {
+      portENTER_CRITICAL(&mux_);
+      ++crcErrors_;
+      portEXIT_CRITICAL(&mux_);
+      return;
+    }
+    acceptTelemetry(packet, info->src_addr, millis());
+    return;
+  }
+
+  if (type == telemetry::PacketType::RawImuBatch &&
+      length == static_cast<int>(sizeof(telemetry::RawImuBatchPacket))) {
+    telemetry::RawImuBatchPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (!telemetry::validatePacket(packet,
+                                   telemetry::PacketType::RawImuBatch)) {
+      portENTER_CRITICAL(&mux_);
+      ++crcErrors_;
+      portEXIT_CRITICAL(&mux_);
+      return;
+    }
+    portENTER_CRITICAL(&mux_);
+    if (rawCount_ == kRawQueueSize) {
+      rawTail_ = (rawTail_ + 1U) % kRawQueueSize;
+      --rawCount_;
+    }
+    rawQueue_[rawHead_] = packet;
+    rawHead_ = (rawHead_ + 1U) % kRawQueueSize;
+    ++rawCount_;
+    portEXIT_CRITICAL(&mux_);
+  }
+}
+
+void RemoteTelemetryReceiver::acceptTelemetry(
+    const telemetry::TelemetryPacket& packet, const uint8_t* mac,
+    uint32_t nowMs) {
+  portENTER_CRITICAL(&mux_);
+  // A restarted node begins again at sequence 0 with a smaller uptime, and a
+  // replacement node has a different MAC. Either case, or a return after the
+  // link went stale, starts a new stream rather than looking like old packets.
+  const bool newStream =
+      !havePacket_ || std::memcmp(mac, peerMac_, sizeof(peerMac_)) != 0 ||
+      packet.uptime_ms < latest_.uptime_ms ||
+      nowMs - lastPacketMs_ > config::kRemoteStaleMs;
+  if (!newStream) {
+    const int32_t delta = static_cast<int32_t>(packet.sequence - latest_.sequence);
+    if (delta == 0) {
+      ++duplicates_;
+      portEXIT_CRITICAL(&mux_);
+      return;
+    }
+    if (delta < 0) {
+      portEXIT_CRITICAL(&mux_);
+      return;
+    }
+    if (delta > 1) packetsLost_ += static_cast<uint32_t>(delta - 1);
+  }
+  latest_ = packet;
+  lastPacketMs_ = nowMs;
+  havePacket_ = true;
+  havePeer_ = true;
+  std::memcpy(peerMac_, mac, sizeof(peerMac_));
+  portEXIT_CRITICAL(&mux_);
+}
+
+void RemoteTelemetryReceiver::sendDiscovery(uint32_t nowMs) {
+  if (!ready_ || nowMs - lastDiscoveryMs_ < config::kRemoteDiscoveryIntervalMs) {
+    return;
+  }
+  lastDiscoveryMs_ = nowMs;
+  telemetry::DiscoveryPacket packet{};
+  telemetry::preparePacket(packet, telemetry::PacketType::Discovery);
+  packet.sequence = discoverySequence_++;
+  packet.uptime_ms = nowMs;
+  telemetry::sealPacket(packet);
+  esp_now_send(kBroadcastMac, reinterpret_cast<const uint8_t*>(&packet),
+               sizeof(packet));
+}
+
+void RemoteTelemetryReceiver::update(uint32_t nowMs) {
+  sendDiscovery(nowMs);
+  uint8_t mac[6]{};
+  bool addPeer = false;
+  portENTER_CRITICAL(&mux_);
+  if (haveDial_ && !dialPeerAdded_) {
+    std::memcpy(mac, dialMac_, 6);
+    addPeer = true;
+  }
+  portEXIT_CRITICAL(&mux_);
+  if (addPeer) {
+    esp_now_peer_info_t peer{};
+    std::memcpy(peer.peer_addr, mac, 6);
+    peer.channel = 0;
+    peer.ifidx = WIFI_IF_STA;
+    const esp_err_t result = esp_now_add_peer(&peer);
+    if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) {
+      portENTER_CRITICAL(&mux_);
+      dialPeerAdded_ = true;
+      portEXIT_CRITICAL(&mux_);
+    }
+  }
+  telemetry::DialAckPacket repeat{};
+  bool repeatReady = false;
+  portENTER_CRITICAL(&mux_);
+  if (dialAckRepeatPending_ && haveDialAck_) {
+    repeat = lastDialAck_;
+    dialAckRepeatPending_ = false;
+    repeatReady = true;
+  }
+  portEXIT_CRITICAL(&mux_);
+  if (repeatReady && dialPeerAdded_) {
+    esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&repeat),
+                 sizeof(repeat));
+  }
+}
+
+bool RemoteTelemetryReceiver::popDialCommand(
+    telemetry::DialCommandPacket& packet) {
+  portENTER_CRITICAL(&mux_);
+  const bool ready = dialCommandReady_;
+  if (ready) {
+    packet = dialCommand_;
+    dialCommandReady_ = false;
+  }
+  portEXIT_CRITICAL(&mux_);
+  return ready;
+}
+
+bool RemoteTelemetryReceiver::dialConnected(uint32_t nowMs) const {
+  portENTER_CRITICAL(&mux_);
+  const bool connected = haveDial_ && nowMs - lastDialMs_ < 5000;
+  portEXIT_CRITICAL(&mux_);
+  return connected;
+}
+
+void RemoteTelemetryReceiver::sendDialStatus(
+    const telemetry::DialStatusPacket& packet, uint32_t nowMs) {
+  if (!ready_ || !dialPeerAdded_ || !dialConnected(nowMs) ||
+      nowMs - lastDialStatusMs_ < 500) return;
+  lastDialStatusMs_ = nowMs;
+  esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&packet),
+               sizeof(packet));
+}
+
+void RemoteTelemetryReceiver::sendDialAck(
+    const telemetry::DialAckPacket& packet) {
+  if (!ready_ || !dialPeerAdded_) return;
+  portENTER_CRITICAL(&mux_);
+  lastDialAck_ = packet;
+  haveDialAck_ = true;
+  portEXIT_CRITICAL(&mux_);
+  esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&packet),
+               sizeof(packet));
+}
+
+NormalizedTelemetry RemoteTelemetryReceiver::snapshot(uint32_t nowMs) const {
+  telemetry::TelemetryPacket packet{};
+  bool havePacket = false;
+  uint32_t lastPacketMs = 0;
+  uint32_t lost = 0;
+  uint32_t duplicates = 0;
+  uint32_t crcErrors = 0;
+  uint32_t versionErrors = 0;
+  portENTER_CRITICAL(&mux_);
+  packet = latest_;
+  havePacket = havePacket_;
+  lastPacketMs = lastPacketMs_;
+  lost = packetsLost_;
+  duplicates = duplicates_;
+  crcErrors = crcErrors_;
+  versionErrors = versionErrors_;
+  portEXIT_CRITICAL(&mux_);
+
+  NormalizedTelemetry result;
+  result.metadata.source = TelemetrySource::AtomS3Remote;
+  result.metadata.packetsLost = lost;
+  result.metadata.duplicates = duplicates;
+  result.metadata.crcErrors = crcErrors;
+  result.metadata.versionErrors = versionErrors;
+  if (!havePacket) return result;
+
+  const uint32_t packetAge = nowMs - lastPacketMs;
+  const bool fresh = packetAge <= config::kRemoteStaleMs;
+  result.metadata.remoteConnected = fresh;
+  result.metadata.remoteSequence = packet.sequence;
+  result.metadata.packetAgeMs = packetAge;
+  result.metadata.remoteTransmitFailures = packet.transmit_failures;
+
+  const uint16_t flags = packet.status_flags;
+  result.gps.positionFresh = fresh && (flags & telemetry::GpsPositionValid);
+  result.gps.altitudeFresh = fresh && (flags & telemetry::GpsAltitudeValid);
+  result.gps.speedFresh = fresh && (flags & telemetry::GpsSpeedValid);
+  result.gps.courseFresh = fresh && (flags & telemetry::GpsCourseValid);
+  result.gps.satellitesValid = fresh && (flags & telemetry::GpsSatellitesValid);
+  result.gps.hdopValid = fresh && (flags & telemetry::GpsHdopValid);
+  result.gps.utcValid = fresh && (flags & telemetry::GpsUtcValid);
+  result.gps.fixValid = fresh && (flags & telemetry::GpsFixValid);
+  result.gps.fixAgeMs =
+      saturatedAdd(static_cast<uint32_t>(packet.gps_age_ms), packetAge);
+  result.gps.utcEpochMs = packet.gps_utc_ms;
+  result.gps.latitude = packet.latitude_deg;
+  result.gps.longitude = packet.longitude_deg;
+  result.gps.altitudeM = packet.altitude_m;
+  result.gps.speedKmh = packet.speed_kmh;
+  result.gps.courseDeg = packet.course_deg;
+  result.gps.satellites = packet.satellites;
+  result.gps.hdop = packet.hdop;
+
+  result.imu.available = fresh && (flags & telemetry::ImuValid);
+  result.imu.valid = result.imu.available;
+  result.imu.calibrated = flags & telemetry::ImuCalibrated;
+  result.imu.axMps2 = packet.accel_x_mps2;
+  result.imu.ayMps2 = packet.accel_y_mps2;
+  result.imu.azMps2 = packet.accel_z_mps2;
+  result.imu.gxDps = packet.gyro_x_dps;
+  result.imu.gyDps = packet.gyro_y_dps;
+  result.imu.gzDps = packet.gyro_z_dps;
+  result.imu.pitchDeg = packet.pitch_deg;
+  result.imu.rollDeg = packet.roll_deg;
+  result.imu.gTotalMps2 =
+      std::sqrt(result.imu.axMps2 * result.imu.axMps2 +
+                result.imu.ayMps2 * result.imu.ayMps2 +
+                result.imu.azMps2 * result.imu.azMps2);
+  if (flags & telemetry::ImuStatisticsValid) {
+    result.imu.accelRmsMps2 = packet.accel_rms_mps2;
+    result.imu.verticalAccelRmsMps2 = packet.vertical_accel_rms_mps2;
+    result.imu.verticalAccelPeakPosMps2 =
+        packet.vertical_accel_peak_pos_mps2;
+    result.imu.verticalAccelPeakNegMps2 =
+        packet.vertical_accel_peak_neg_mps2;
+    result.imu.lateralAccelPeakMps2 = packet.lateral_accel_peak_mps2;
+    result.imu.longitudinalAccelPeakMps2 =
+        packet.longitudinal_accel_peak_mps2;
+    result.imu.vibrationRmsMps2 = packet.vibration_rms_mps2;
+    result.imu.sampleCount = packet.imu_sample_count;
+  }
+  return result;
+}
+
+bool RemoteTelemetryReceiver::popRawImuBatch(
+    telemetry::RawImuBatchPacket& packet) {
+  portENTER_CRITICAL(&mux_);
+  if (rawCount_ == 0) {
+    portEXIT_CRITICAL(&mux_);
+    return false;
+  }
+  packet = rawQueue_[rawTail_];
+  rawTail_ = (rawTail_ + 1U) % kRawQueueSize;
+  --rawCount_;
+  portEXIT_CRITICAL(&mux_);
+  return true;
+}
+
+const char* RemoteTelemetryReceiver::statusText(uint32_t nowMs) const {
+  if (!ready_) return "INIT FAILED";
+  portENTER_CRITICAL(&mux_);
+  const bool havePacket = havePacket_;
+  const uint32_t lastPacketMs = lastPacketMs_;
+  portEXIT_CRITICAL(&mux_);
+  if (!havePacket) return "SEARCHING";
+  return nowMs - lastPacketMs <= config::kRemoteStaleMs ? "CONNECTED"
+                                                        : "LOST";
+}
+
+String RemoteTelemetryReceiver::peerMacText() const {
+  uint8_t mac[6]{};
+  bool havePeer = false;
+  portENTER_CRITICAL(&mux_);
+  havePeer = havePeer_;
+  std::memcpy(mac, peerMac_, sizeof(mac));
+  portEXIT_CRITICAL(&mux_);
+  if (!havePeer) return "--:--:--:--:--:--";
+  char text[18]{};
+  snprintf(text, sizeof(text), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],
+           mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(text);
+}

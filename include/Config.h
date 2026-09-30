@@ -22,6 +22,21 @@ constexpr int kCapLoraCsPin = 5;  // Keep SX1262 deselected while SD uses SPI.
 
 constexpr uint32_t kGpsBaudScanIntervalMs = 2'500;
 constexpr uint32_t kGpsSourceStaleMs = 5'000;
+// R switches between LOCAL_GPS and ATOMS3_REMOTE at runtime and persists the
+// selection. The local mode remains the default to preserve existing installs.
+constexpr bool kDefaultToAtomS3Remote = false;
+constexpr uint32_t kRemoteStaleMs = 3'000;
+constexpr uint32_t kRemoteDiscoveryIntervalMs = 1'000;
+// Leave zero for discovery, or paste the AtomS3 station MAC shown on its
+// display/serial output to restrict reception to that node.
+constexpr uint8_t kAtomEspNowMac[6] = {0, 0, 0, 0, 0, 0};
+// Optionally restrict Dial commands to a known station MAC. Leaving zero
+// accepts the first Dial seen until reboot; ESP-NOW packets are not encrypted.
+constexpr uint8_t kDialEspNowMac[6] = {0, 0, 0, 0, 0, 0};
+
+#ifndef ENABLE_RAW_IMU_LOGGING
+#define ENABLE_RAW_IMU_LOGGING 0
+#endif
 
 // Optional Wi-Fi/NTP and coordinate-based timezone discovery. Credentials and
 // overrides are read from kLoggerConfigPath on the SD card; they are never
@@ -78,6 +93,7 @@ constexpr char kFilePrefix[] = "telemetry_";
 constexpr char kKmlDirectory[] = "/telemetry/kml";
 constexpr uint16_t kKmlLinesPerUpdate = 12;
 constexpr uint16_t kKmlFlushEveryPoints = 128;
+constexpr char kWebHostname[] = "jp226-logger";
 
 }  // namespace config
 

@@ -7,6 +7,8 @@ run on either model. M5Unified detects the board at runtime:
 - Cardputer ADV: logs the onboard BMI270 accelerometer and gyroscope.
 - Original Cardputer: leaves the IMU numeric fields empty and writes
   `imu_available=0` and `imu_type=none`.
+- Either Cardputer can select `ATOMS3_REMOTE` and receive GPS plus MPU6886 IMU
+  telemetry from an AtomS3 fitted to an Atomic GPS Base over ESP-NOW.
 
 The project builds successfully against Arduino-ESP32 3.3.9, M5Cardputer tag
 1.2.0, M5Unified 0.2.22 and TinyGPSPlus 1.1.0. The included app binary is ready
@@ -33,6 +35,8 @@ development, donations are welcome through
 - One supported UART NMEA GPS source:
   - M5Stack Unit GPS with AT6558 (or another Grove NMEA receiver), or
   - M5Stack Cap LoRa-1262 onboard ATGM336H-6N GPS on Cardputer ADV
+- Optional remote source: M5Stack AtomS3 (not AtomS3 Lite) plus Atomic GPS Base
+  A134 or A134-V2. The AtomS3 needs USB/5 V power but no microSD card.
 - FAT32 microSD card (32 GB or smaller is the conservative choice for Launcher)
 - HY2.0-4P/Grove cable when using an external GPS Unit
 
@@ -86,6 +90,9 @@ Hardware/API references:
 - [Official Cardputer ADV IMU example](https://docs.m5stack.com/en/arduino/m5cardputer/imu)
 - [M5Stack AT6558 GPS Unit](https://docs.m5stack.com/en/unit/gps)
 - [M5Stack Cap LoRa-1262 pin map and GPS specifications](https://docs.m5stack.com/en/cap/Cap_LoRa-1262)
+- [AtomS3 product and MPU6886 details](https://docs.m5stack.com/en/core/AtomS3)
+- [Atomic GPS Base](https://docs.m5stack.com/en/atom/Atomic%20GPS%20Base)
+- [Atomic GPS Base v2.0](https://docs.m5stack.com/en/atom/Atomic_GPS_Base_v2.0)
 
 ## Open and build in VS Code
 
@@ -104,6 +111,27 @@ The build artifacts are generated under `.pio/build/m5stack-stamps3/`:
 
 Prebuilt copies from the verified build are in `dist/`.
 
+### Build and flash the AtomS3 remote
+
+The remote is a separate PlatformIO project so it cannot accidentally be
+flashed to a Cardputer:
+
+```powershell
+platformio run -d atoms3_gps_imu
+platformio run -d atoms3_gps_imu -t upload --upload-port COMx
+```
+
+Fit the AtomS3 to the powered-off Atomic GPS Base, connect USB-C, replace
+`COMx` with its serial port and upload. The display and serial console show its
+Wi-Fi station MAC, GPS/IMU state, radio channel and link status. Both A134
+(9600 baud) and A134-V2 (115200 baud) are auto-detected. The firmware consumes
+NMEA as quickly as the installed receiver produces it and publishes at up to
+10 Hz; it does not force a receiver-specific update-rate command.
+
+See [Remote node setup](docs/remote-node.md) for mounting, zeroing, pairing,
+flashing and troubleshooting, and [Telemetry protocol](docs/telemetry-protocol.md)
+for the packed wire format.
+
 ## Controls
 
 | Key | Action |
@@ -113,12 +141,17 @@ Prebuilt copies from the verified build are in `dist/`.
 | `1`–`9` | Open dashboard pages 1–9 directly |
 | `0` | Open the KML export page (page 10) |
 | `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
+| `R` | Switch telemetry mode between `LOCAL_GPS` and `ATOMS3_REMOTE` |
 | `W` | Open the Wi-Fi setup page and scan for nearby networks |
 | `K` | Open the KML page and rescan all finished days for missing exports |
+| `P` | Open the WAYPOINT page |
+| `A` on WAYPOINT | Save a waypoint immediately from the selected GPS source |
+| `N`, `T`, `F` on WAYPOINT | Edit the last waypoint's name, note or photo reference |
+| `V` on WAYPOINT | Toggle last-waypoint details |
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
 
-The selected page is remembered across restarts. The ten pages are:
+The selected page is remembered across restarts. The eleven pages are:
 
 1. Combined GPS/IMU summary
 2. Large current speed
@@ -130,6 +163,13 @@ The selected page is remembered across restarts. The ten pages are:
 8. Logger, SD card, row count, file and parked-schedule status
 9. Large local clock, date and timezone status
 10. Daily CSV-to-KML export status and manual rescan
+11. Waypoint creation, editing and last-location details
+
+Waypoints are saved independently of the moving/parked logging schedule.
+Their original ID, timestamp and coordinates survive later text edits.
+An optional M5Dial remote can create categorized waypoints and set the vehicle
+context that is captured with each waypoint. See
+[Waypoint and Dial setup](docs/waypoints.md).
 
 Dashboard and Wi-Fi setup frames are drawn off-screen and transferred to the
 LCD in one operation to prevent visible clearing/flicker. Wi-Fi results use
@@ -222,11 +262,11 @@ timezone_auto=true
 # timezone=AEST-10AEDT,M10.1.0,M4.1.0/3
 ```
 
-The logger never requires Wi-Fi to record. Wi-Fi is used only for NTP and the
-optional coordinate-to-timezone lookup. The configuration file stores the
-Wi-Fi password as plain text on the SD card, so keep the card private. Automatic
-timezone lookup sends the current GPS coordinates to `timeapi.io`; set
-`timezone_auto=false` to disable this.
+The logger never requires Wi-Fi to record. Wi-Fi is used for NTP, the optional
+coordinate-to-timezone lookup, and the local file portal described below. The
+configuration file stores the Wi-Fi password as plain text on the SD card, so
+keep the card private. Automatic timezone lookup sends the current GPS
+coordinates to `timeapi.io`; set `timezone_auto=false` to disable this.
 
 On the ADV, M5Unified restores system UTC from the onboard RTC at boot. A fresh
 GPS or NTP time periodically corrects that RTC. The original Cardputer has no
@@ -236,6 +276,44 @@ a file; this prevents wrongly dated files.
 Each append is flushed immediately. If the SD card is missing or an append
 fails, the logger closes the file and retries the card every 10 seconds. An
 existing daily file is appended to and does not receive a second header.
+
+## iPhone and iPad file portal
+
+When the Cardputer is connected to Wi-Fi, it serves a responsive local web page
+designed for an iPhone 16 Pro Max and a 12.9-inch iPad Pro. Join the phone or
+tablet to the same travel-router network, then open:
+
+```text
+http://jp226-logger.local
+```
+
+The Wi-Fi dashboard page explicitly shows `WEB: HTTP PORT 80`, the Cardputer's
+numeric IP address, and `http://jp226-logger.local`. If the router blocks mDNS
+or multicast discovery, use the numeric IP instead, for example
+`http://192.168.1.42/`. Do not use `https://`.
+
+The portal provides:
+
+- large, touch-friendly GPS, logging, SD and KML status cards;
+- the latest speed, local clock, timezone and connected Wi-Fi network;
+- a newest-first list of daily CSV and KML files on the microSD card;
+- direct CSV/KML download buttons; and
+- a button to rescan completed CSV days for missing KML files.
+
+The file portal is deliberately read-only: it cannot upload, rename or delete
+files. Downloads are accepted only after the logger has positively entered
+`STOPPED_15M` or `STOPPED_HOURLY`. This prevents a large synchronous SD/network
+transfer from delaying NMEA processing while driving. If KML conversion is
+requested while moving, the request remains queued and starts automatically
+after the vehicle is confirmed stopped. Movement resuming pauses conversion
+immediately and it resumes after the vehicle is stopped again. If power is lost,
+an incomplete `.tmp` export is discarded and rebuilt on a later stopped scan.
+
+This is a local-network interface, not a cloud service, and it does not need
+working Starlink Internet once the devices are connected to the same router.
+It has no login, so use it only on a trusted travel-router network. Do not add a
+public Internet port-forward to the Cardputer. A properly configured VPN is the
+safer option if access is ever needed from outside the vehicle network.
 
 ## Google Earth and Google Maps KML export
 
@@ -251,12 +329,13 @@ conversion, and continues logging to the new date. On every boot it also scans
 for older CSV files that do not yet have a KML. Press `K` at any time to open
 page 10 and run that scan manually.
 
-Conversion is streamed a few CSV rows at a time so a large file is never loaded
-into RAM and GPS reception continues in the background. Only valid latitude and
-longitude rows are included. Current 26-column logs require `fix_valid=1`;
-older compatible logs without that column are accepted when their `lat` and
-`lon` values are valid. The route is stored as a ground-clamped KML
-`LineString`, using the required `longitude,latitude,altitude` coordinate order.
+Conversion runs only while the vehicle is confirmed stopped. It is streamed a
+few CSV rows at a time so a large file is never loaded into RAM, and it pauses
+as soon as movement resumes. Only valid latitude and longitude rows are
+included. Current 26-column logs require `fix_valid=1`; older compatible logs
+without that column are accepted when their `lat` and `lon` values are valid.
+The route is stored as a ground-clamped KML `LineString`, using the required
+`longitude,latitude,altitude` coordinate order.
 
 The exporter writes a `.tmp` file first and renames it only after the complete
 KML is safely closed. A restart or power loss therefore cannot leave a partial
@@ -315,6 +394,7 @@ All user-tunable constants are in `include/Config.h`. The main ones are:
 | `kGpsSourceStaleMs` | 5 s | Source failover/detection timeout |
 | `kTimezoneLookupIntervalMs` | 6 h | Online location-timezone refresh interval |
 | `kTimezoneLookupRetryMs` | 15 min | Retry delay after an unavailable lookup |
+| `kWebHostname` | `jp226-logger` | Local mDNS hostname for the file portal |
 | `kMoveStartKmh` | 3.0 km/h | Immediate moving threshold |
 | `kMoveStopKmh` | 1.5 km/h | Candidate stopped threshold |
 | `kStopConfirmMs` | 10 s | Low-speed dwell before stopped |
@@ -355,7 +435,7 @@ errors. Seven diagnostic columns are appended.
 | `gyro_x_dps`, `gyro_y_dps`, `gyro_z_dps` | ADV angular rate in degrees/second |
 | `pitch_deg`, `roll_deg` | Gravity-derived attitude; meaningful when linear acceleration is modest |
 | `g_total` | Magnitude of the acceleration vector in g |
-| `roughness_index` | RMS high-pass change in acceleration magnitude since the previous row, in g |
+| `roughness_index` | Local ADV: legacy RMS high-pass acceleration magnitude; AtomS3: vertical vibration RMS, both in g |
 | `local_timestamp` | ISO-8601 local timestamp with UTC offset |
 | `fix_valid` | `1` only when all configured GPS quality gates pass |
 | `fix_age_ms` | Age of the last parsed position |
@@ -363,9 +443,58 @@ errors. Seven diagnostic columns are appended.
 | `imu_type` | Detected M5Unified IMU type (`BMI270`, `none`, etc.) |
 | `log_state` | State-machine mode that caused the row |
 | `uptime_ms` | 64-bit boot uptime for diagnostics |
+| `telemetry_source` | `LOCAL_GPS` or `ATOMS3_REMOTE` |
+| `remote_sequence` | AtomS3 packet sequence; empty for local telemetry |
+| `accel_x_mps2`, `accel_y_mps2`, `accel_z_mps2` | Installed-frame acceleration in m/s^2 |
+| `accel_rms_mps2` | One-second dynamic acceleration RMS |
+| `vertical_accel_rms_mps2` | One-second vertical dynamic acceleration RMS |
+| `vertical_accel_peak_pos_mps2`, `vertical_accel_peak_neg_mps2` | One-second signed vertical peaks |
+| `lateral_accel_peak_mps2`, `longitudinal_accel_peak_mps2` | One-second absolute vehicle-axis peaks |
+| `vibration_rms_mps2` | One-second vertical vibration/roughness RMS |
+| `imu_samples` | Samples contributing to the statistics interval |
+| `gps_age_ms`, `packet_age_ms` | Source fix age and Cardputer receive age |
+| `packets_lost`, `duplicate_packets`, `crc_errors` | Cumulative link diagnostics |
+| `remote_tx_failures` | AtomS3 cumulative ESP-NOW send failures |
+| `poi`, `poi_source` | Current user label/waypoint or automatic place, and its origin |
+| `auto_place` | Independently retained automatic locality name |
+| `waypoint_id` | ID of the nearby user waypoint, if one has priority |
 
-On the original Cardputer, all ten IMU-derived numeric columns are empty. This is
-intentional and keeps them numeric-friendly for CSV import.
+On the original Cardputer in `LOCAL_GPS`, IMU numeric columns remain empty. In
+`ATOMS3_REMOTE`, both original Cardputer revisions receive the AtomS3 IMU data.
+The normal CSV still follows the existing moving/15-minute/hourly schedule; it
+does not write at the 100 Hz IMU sample rate.
+
+### Optional raw IMU file
+
+Set `-DENABLE_RAW_IMU_LOGGING=1` in both PlatformIO projects to transmit
+16-sample batches and create `/telemetry/imu_YYYY-MM-DD.csv`. Cardputer writes
+32 rows per buffered flush. This is off by default because 100 Hz data grows
+quickly and increases SD wear. The normal telemetry CSV is unchanged when the
+option is disabled.
+
+## Architecture and future Cardputer ADV mode
+
+Acquisition is separated from the logger as:
+
+```text
+local UART GPS + local IMU ---\
+                                > NormalizedTelemetry -> movement rules -> CSV/UI
+AtomS3 ESP-NOW receiver -------/
+```
+
+`TelemetrySource::CardputerAdv` is reserved so a future ADV implementation can
+combine a directly connected AT6558 with its internal BMI270 without changing
+the CSV, movement scheduling or display consumers. The current ADV local mode
+continues to work as before; no ADV-only dependency was added to original
+Cardputer builds.
+
+Known limitations: ESP-NOW is unencrypted in this first version; set the MAC
+allow-lists to reject unrelated nodes. Discovery follows the Cardputer's
+current 2.4 GHz channel, including after it joins Wi-Fi, but some access points
+with aggressive channel steering can extend reconnection time. GPS update rate
+is limited by the receiver's saved NMEA configuration. Hardware-in-loop GPS,
+radio-range and axis-sign validation should be completed in the installed
+vehicle before relying on derived suspension metrics.
 
 ## Project layout
 
@@ -374,10 +503,19 @@ include/Config.h          hardware pins, thresholds and intervals
 include/KmlExporter.h     restart-safe streaming KML export interface
 include/LocationTime.h    Wi-Fi/NTP/location-timezone interface
 include/LogSchedule.h     pure stopped-schedule interface
+include/TelemetryData.h   source-neutral GPS, IMU and link data model
+include/RemoteTelemetryReceiver.h  ESP-NOW receive/discovery interface
+include/WebPortal.h       responsive read-only CSV/KML portal interface
 src/LocationTime.cpp      optional network time and timezone implementation
 src/KmlExporter.cpp       daily CSV discovery and Google KML generation
 src/LogSchedule.cpp       15-minute/hourly boundary calculations
+src/RemoteTelemetryReceiver.cpp  packet validation and normalized reception
+src/WebPortal.cpp         local status, file listing and download web server
 src/main.cpp              GPS, IMU, clock, NVS, SD, CSV and display logic
+shared/TelemetryProtocol.h  versioned 136-byte packet, CRC and raw batch format
+atoms3_gps_imu/           independent AtomS3 + Atomic GPS Base firmware
+m5dial_waypoint/           independent M5Dial control firmware
+docs/                     remote setup and telemetry protocol reference
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests
 dist/                     verified Launcher and factory binaries

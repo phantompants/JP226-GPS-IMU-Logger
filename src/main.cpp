@@ -9,6 +9,7 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -17,6 +18,11 @@
 #include "KmlExporter.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
+#include "PlaceResolver.h"
+#include "RemoteTelemetryReceiver.h"
+#include "TelemetryData.h"
+#include "WaypointStore.h"
+#include "WebPortal.h"
 #include "WifiSetupPage.h"
 
 namespace {
@@ -25,7 +31,16 @@ constexpr char kCsvHeader[] =
     "timestamp,lat,lon,alt_m,speed_kmh,heading_deg,satellites,hdop,vdop,"
     "acc_x_g,acc_y_g,acc_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,pitch_deg,"
     "roll_deg,g_total,roughness_index,local_timestamp,fix_valid,fix_age_ms,"
-    "imu_available,imu_type,log_state,uptime_ms";
+    "imu_available,imu_type,log_state,uptime_ms,telemetry_source,"
+    "remote_sequence,accel_x_mps2,accel_y_mps2,accel_z_mps2,"
+    "accel_rms_mps2,vertical_accel_rms_mps2,"
+    "vertical_accel_peak_pos_mps2,vertical_accel_peak_neg_mps2,"
+    "lateral_accel_peak_mps2,longitudinal_accel_peak_mps2,"
+    "vibration_rms_mps2,imu_samples,gps_age_ms,packet_age_ms,"
+    "packets_lost,duplicate_packets,crc_errors,remote_tx_failures,"
+    "poi,poi_source,auto_place,waypoint_id";
+
+constexpr float kStandardGravityMps2 = 9.80665f;
 
 enum class LogMode : uint8_t {
   WaitingForFix = 0,
@@ -52,43 +67,11 @@ enum class DashboardPage : uint8_t {
   Logger,
   TimeNetwork,
   KmlExport,
+  Waypoint,
   Count,
 };
 
-struct GpsSnapshot {
-  bool fixValid = false;
-  bool positionFresh = false;
-  bool speedFresh = false;
-  bool altitudeFresh = false;
-  bool courseFresh = false;
-  bool satellitesValid = false;
-  bool hdopValid = false;
-  bool vdopValid = false;
-  uint32_t fixAgeMs = UINT32_MAX;
-  double latitude = 0.0;
-  double longitude = 0.0;
-  double altitudeM = 0.0;
-  double speedKmh = 0.0;
-  double courseDeg = 0.0;
-  uint32_t satellites = 0;
-  double hdop = 0.0;
-  double vdop = 0.0;
-};
-
-struct ImuSample {
-  bool available = false;
-  bool valid = false;
-  float ax = 0.0f;
-  float ay = 0.0f;
-  float az = 0.0f;
-  float gx = 0.0f;
-  float gy = 0.0f;
-  float gz = 0.0f;
-  float pitch = 0.0f;
-  float roll = 0.0f;
-  float gTotal = 0.0f;
-  float roughness = 0.0f;
-};
+enum class WaypointEditor : uint8_t { Closed, Name, Note, Photo };
 
 class ImuSampler {
  public:
@@ -109,41 +92,74 @@ class ImuSampler {
     const auto data = M5.Imu.getImuData();
     latest_.available = true;
     latest_.valid = true;
-    latest_.ax = data.accel.x;
-    latest_.ay = data.accel.y;
-    latest_.az = data.accel.z;
-    latest_.gx = data.gyro.x;
-    latest_.gy = data.gyro.y;
-    latest_.gz = data.gyro.z;
-    latest_.gTotal = std::sqrt(latest_.ax * latest_.ax + latest_.ay * latest_.ay +
-                               latest_.az * latest_.az);
-    latest_.pitch = std::atan2(-latest_.ax,
-                               std::sqrt(latest_.ay * latest_.ay +
-                                         latest_.az * latest_.az)) *
-                    180.0f / PI;
-    latest_.roll = std::atan2(latest_.ay, latest_.az) * 180.0f / PI;
+    latest_.axMps2 = data.accel.x * kStandardGravityMps2;
+    latest_.ayMps2 = data.accel.y * kStandardGravityMps2;
+    latest_.azMps2 = data.accel.z * kStandardGravityMps2;
+    latest_.gxDps = data.gyro.x;
+    latest_.gyDps = data.gyro.y;
+    latest_.gzDps = data.gyro.z;
+    latest_.gTotalMps2 =
+        std::sqrt(latest_.axMps2 * latest_.axMps2 +
+                  latest_.ayMps2 * latest_.ayMps2 +
+                  latest_.azMps2 * latest_.azMps2);
+    latest_.pitchDeg =
+        std::atan2(-latest_.axMps2,
+                   std::sqrt(latest_.ayMps2 * latest_.ayMps2 +
+                             latest_.azMps2 * latest_.azMps2)) *
+        180.0f / PI;
+    latest_.rollDeg =
+        std::atan2(latest_.ayMps2, latest_.azMps2) * 180.0f / PI;
 
     if (!gravityFilterReady_) {
-      gravityMagnitude_ = latest_.gTotal;
+      gravityMagnitude_ = latest_.gTotalMps2;
       gravityFilterReady_ = true;
     } else {
       constexpr float alpha = 0.02f;
-      gravityMagnitude_ += alpha * (latest_.gTotal - gravityMagnitude_);
+      gravityMagnitude_ += alpha * (latest_.gTotalMps2 - gravityMagnitude_);
     }
-    const float vibration = latest_.gTotal - gravityMagnitude_;
-    roughnessSumSquares_ += static_cast<double>(vibration) * vibration;
-    ++roughnessCount_;
+    const float vertical = latest_.azMps2 - gravityMagnitude_;
+    const float magnitudeHighPass = latest_.gTotalMps2 - gravityMagnitude_;
+    sumMagnitudeHighPassSquares_ +=
+        static_cast<double>(magnitudeHighPass) * magnitudeHighPass;
+    const float dynamicMagnitude =
+        std::sqrt(latest_.axMps2 * latest_.axMps2 +
+                  latest_.ayMps2 * latest_.ayMps2 + vertical * vertical);
+    sumAccelSquares_ += static_cast<double>(dynamicMagnitude) * dynamicMagnitude;
+    sumVerticalSquares_ += static_cast<double>(vertical) * vertical;
+    verticalPeakPos_ = std::max(verticalPeakPos_, vertical);
+    verticalPeakNeg_ = std::min(verticalPeakNeg_, vertical);
+    lateralPeak_ = std::max(lateralPeak_, std::fabs(latest_.ayMps2));
+    longitudinalPeak_ = std::max(longitudinalPeak_, std::fabs(latest_.axMps2));
+    ++statisticsCount_;
   }
 
   ImuSample snapshotAndResetRoughness() {
     ImuSample result = latest_;
     result.available = available_;
-    if (available_ && roughnessCount_ > 0) {
-      result.roughness =
-          std::sqrt(roughnessSumSquares_ / static_cast<double>(roughnessCount_));
+    if (available_ && statisticsCount_ > 0) {
+      result.accelRmsMps2 =
+          std::sqrt(sumAccelSquares_ / static_cast<double>(statisticsCount_));
+      result.verticalAccelRmsMps2 = std::sqrt(
+          sumVerticalSquares_ / static_cast<double>(statisticsCount_));
+      result.verticalAccelPeakPosMps2 = verticalPeakPos_;
+      result.verticalAccelPeakNegMps2 = verticalPeakNeg_;
+      result.lateralAccelPeakMps2 = lateralPeak_;
+      result.longitudinalAccelPeakMps2 = longitudinalPeak_;
+      result.vibrationRmsMps2 = result.verticalAccelRmsMps2;
+      result.legacyRoughnessMps2 = std::sqrt(
+          sumMagnitudeHighPassSquares_ /
+          static_cast<double>(statisticsCount_));
+      result.sampleCount = static_cast<uint16_t>(
+          std::min<uint32_t>(statisticsCount_, UINT16_MAX));
     }
-    roughnessSumSquares_ = 0.0;
-    roughnessCount_ = 0;
+    sumAccelSquares_ = 0.0;
+    sumVerticalSquares_ = 0.0;
+    sumMagnitudeHighPassSquares_ = 0.0;
+    verticalPeakPos_ = 0.0f;
+    verticalPeakNeg_ = 0.0f;
+    lateralPeak_ = 0.0f;
+    longitudinalPeak_ = 0.0f;
+    statisticsCount_ = 0;
     return result;
   }
 
@@ -175,9 +191,15 @@ class ImuSampler {
   bool gravityFilterReady_ = false;
   const char* typeName_ = "none";
   uint32_t lastSampleMs_ = 0;
-  float gravityMagnitude_ = 1.0f;
-  double roughnessSumSquares_ = 0.0;
-  uint32_t roughnessCount_ = 0;
+  float gravityMagnitude_ = kStandardGravityMps2;
+  double sumAccelSquares_ = 0.0;
+  double sumVerticalSquares_ = 0.0;
+  double sumMagnitudeHighPassSquares_ = 0.0;
+  float verticalPeakPos_ = 0.0f;
+  float verticalPeakNeg_ = 0.0f;
+  float lateralPeak_ = 0.0f;
+  float longitudinalPeak_ = 0.0f;
+  uint32_t statisticsCount_ = 0;
   ImuSample latest_;
 };
 
@@ -283,16 +305,28 @@ GpsReceiver* activeGps = &groveGps;
 SPIClass sdSpi(FSPI);
 Preferences preferences;
 ImuSampler imu;
+RemoteTelemetryReceiver remoteReceiver;
+WaypointStore waypointStore;
+PlaceResolver placeResolver;
+VehicleContext vehicleContext;
 LocationTime locationTime;
 KmlExporter kmlExporter;
+WebPortal webPortal;
 WifiSetupPage wifiSetup;
 M5Canvas dashboardCanvas(&M5Cardputer.Display);
 File logFile;
 String currentLogPath;
 String lastKmlScanDate;
+#if ENABLE_RAW_IMU_LOGGING
+File rawImuFile;
+String currentRawImuPath;
+String rawImuBuffer;
+uint16_t rawImuBufferedRows = 0;
+#endif
 
 bool sdMounted = false;
 bool locationTimeStarted = false;
+bool placeResolverStarted = false;
 bool screenOn = true;
 bool immediateLogRequested = false;
 bool stopCandidateActive = false;
@@ -308,6 +342,7 @@ uint32_t lastSdAttemptMs = 0;
 uint32_t lastClockSyncMs = 0;
 uint32_t lastRtcWriteMs = 0;
 uint64_t rowsWritten = 0;
+uint32_t tripStartedMs = 0;
 uint8_t displayBrightness = 128;
 size_t groveBaudIndex = 0;
 uint32_t groveBaudStartedMs = 0;
@@ -318,7 +353,28 @@ time_t persistedNextDueUtc = 0;
 LogMode mode = LogMode::WaitingForFix;
 GpsPreference gpsPreference = GpsPreference::Auto;
 DashboardPage dashboardPage = DashboardPage::Combined;
+TelemetrySource telemetrySource = TelemetrySource::LocalGps;
+NormalizedTelemetry activeTelemetry;
 bool dashboardCanvasReady = false;
+bool haveDashboardFrameHash = false;
+uint32_t lastDashboardFrameHash = 0;
+WaypointEditor waypointEditor = WaypointEditor::Closed;
+String waypointInput;
+String waypointMessage;
+uint32_t waypointMessageStartedMs = 0;
+bool waypointShowLast = false;
+String autoPlace;
+
+uint32_t frameBufferHash(const M5Canvas& canvas) {
+  const auto* bytes = static_cast<const uint8_t*>(canvas.getBuffer());
+  const size_t length = canvas.bufferLength();
+  uint32_t hash = 2166136261U;
+  for (size_t index = 0; index < length; ++index) {
+    hash ^= bytes[index];
+    hash *= 16777619U;
+  }
+  return hash;
+}
 
 int64_t daysFromCivil(int year, unsigned month, unsigned day) {
   year -= month <= 2;
@@ -353,19 +409,17 @@ bool clockIsReady() {
   return now > 0 && gmtime_r(&now, &utc) != nullptr && utc.tm_year + 1900 >= 2024;
 }
 
-void syncClockFromGps(GpsReceiver& receiver, uint32_t nowMs) {
-  TinyGPSPlus& gps = receiver.parser();
-  if (!gps.date.isValid() || !gps.time.isValid() ||
-      gps.date.age() > config::kMaxDateTimeAgeMs ||
-      gps.time.age() > config::kMaxDateTimeAgeMs ||
+void syncClockFromTelemetry(const GpsSnapshot& gps, uint32_t nowMs) {
+  if (!gps.utcValid || gps.utcEpochMs == 0 ||
       (clockIsReady() && nowMs - lastClockSyncMs < config::kClockResyncIntervalMs)) {
     return;
   }
-  const time_t epoch = gpsUtcEpoch(gps);
+  const time_t epoch = static_cast<time_t>(gps.utcEpochMs / 1000ULL);
   if (epoch <= 0) {
     return;
   }
-  timeval value{epoch, static_cast<suseconds_t>(gps.time.centisecond()) * 10000};
+  timeval value{epoch,
+                static_cast<suseconds_t>((gps.utcEpochMs % 1000ULL) * 1000ULL)};
   settimeofday(&value, nullptr);
   lastClockSyncMs = nowMs;
 
@@ -430,11 +484,57 @@ GpsSnapshot takeGpsSnapshot(GpsReceiver& receiver) {
   const bool dateTimeFresh = gps.date.isValid() && gps.time.isValid() &&
                              gps.date.age() <= config::kMaxDateTimeAgeMs &&
                              gps.time.age() <= config::kMaxDateTimeAgeMs;
+  sample.utcValid = dateTimeFresh;
+  if (dateTimeFresh) {
+    sample.utcEpochMs =
+        static_cast<uint64_t>(gpsUtcEpoch(gps)) * 1000ULL +
+        static_cast<uint64_t>(gps.time.centisecond()) * 10ULL;
+  }
   sample.fixValid = sample.positionFresh && sample.speedFresh && dateTimeFresh &&
                     sample.satellitesValid &&
                     sample.satellites >= config::kMinimumSatellites &&
                     sample.hdopValid && sample.hdop <= config::kMaximumHdop;
   return sample;
+}
+
+const char* telemetrySourceName(TelemetrySource source) {
+  switch (source) {
+    case TelemetrySource::AtomS3Remote:
+      return "ATOMS3_REMOTE";
+    case TelemetrySource::CardputerAdv:
+      return "CARDPUTER_ADV";
+    default:
+      return "LOCAL_GPS";
+  }
+}
+
+NormalizedTelemetry takeLocalTelemetry() {
+  NormalizedTelemetry result;
+  result.gps = takeGpsSnapshot(*activeGps);
+  result.imu = imu.latest();
+  result.metadata.source = TelemetrySource::LocalGps;
+  return result;
+}
+
+void currentPoi(const GpsSnapshot& gps, String& poi, String& source,
+                String& waypointId) {
+  poi = "";
+  source = "NONE";
+  waypointId = "";
+  if (!gps.positionFresh) return;
+  if (waypointStore.hasLast() &&
+      waypointStore.distanceFromLastM(gps.latitude, gps.longitude) <= 2000.0) {
+    const WaypointRecord& last = waypointStore.last();
+    poi = last.name;
+    source = last.source;
+    waypointId = last.id;
+    if (source == "PHOTO_REFERENCE" && !last.photoReference.isEmpty()) {
+      poi = last.photoReference;
+    }
+  } else if (!autoPlace.isEmpty()) {
+    poi = autoPlace;
+    source = "AUTO_PLACE";
+  }
 }
 
 const char* modeName(LogMode value) {
@@ -605,6 +705,84 @@ String localDateText(time_t nowUtc) {
   return String(date);
 }
 
+void markSdFailed(uint32_t nowMs);
+bool mountSd(uint32_t nowMs, bool force = false);
+
+#if ENABLE_RAW_IMU_LOGGING
+String rawImuPathForLocalDay(time_t nowUtc) {
+  struct tm local {};
+  localtime_r(&nowUtc, &local);
+  char path[64]{};
+  snprintf(path, sizeof(path), "%s/imu_%04d-%02d-%02d.csv",
+           config::kLogDirectory, local.tm_year + 1900, local.tm_mon + 1,
+           local.tm_mday);
+  return String(path);
+}
+
+bool openRawImuFile(time_t nowUtc, uint32_t nowMs) {
+  if (!mountSd(nowMs)) return false;
+  const String requiredPath = rawImuPathForLocalDay(nowUtc);
+  if (rawImuFile && currentRawImuPath == requiredPath) return true;
+  if (rawImuFile) {
+    if (!rawImuBuffer.isEmpty()) rawImuFile.print(rawImuBuffer);
+    rawImuFile.flush();
+    rawImuFile.close();
+  }
+  rawImuBuffer = "";
+  rawImuBufferedRows = 0;
+  currentRawImuPath = requiredPath;
+  rawImuFile = SD.open(currentRawImuPath, FILE_APPEND);
+  if (!rawImuFile) {
+    markSdFailed(nowMs);
+    return false;
+  }
+  if (rawImuFile.size() == 0) {
+    rawImuFile.println(
+        "received_timestamp,node_batch_ms,offset_100us,accel_x_mps2,"
+        "accel_y_mps2,accel_z_mps2,gyro_x_dps,gyro_y_dps,gyro_z_dps");
+    rawImuFile.flush();
+  }
+  return true;
+}
+
+void writeRawImuBatches(time_t nowUtc, uint32_t nowMs) {
+  telemetry::RawImuBatchPacket batch{};
+  while (remoteReceiver.popRawImuBatch(batch)) {
+    if (!clockIsReady() || !openRawImuFile(nowUtc, nowMs)) continue;
+    char receivedTimestamp[40]{};
+    formatUtcTimestamp(receivedTimestamp, sizeof(receivedTimestamp));
+    const uint8_t count = std::min<uint8_t>(
+        batch.sample_count, telemetry::kRawImuSamplesPerPacket);
+    for (uint8_t index = 0; index < count; ++index) {
+      const auto& sample = batch.samples[index];
+      char row[256]{};
+      snprintf(row, sizeof(row),
+               "%s,%lu,%u,%.5f,%.5f,%.5f,%.1f,%.1f,%.1f\n",
+               receivedTimestamp,
+               static_cast<unsigned long>(batch.batch_start_time_ms),
+               sample.time_offset_100us,
+               sample.accel_x_mg * kStandardGravityMps2 / 1000.0f,
+               sample.accel_y_mg * kStandardGravityMps2 / 1000.0f,
+               sample.accel_z_mg * kStandardGravityMps2 / 1000.0f,
+               sample.gyro_x_deci_dps / 10.0f,
+               sample.gyro_y_deci_dps / 10.0f,
+               sample.gyro_z_deci_dps / 10.0f);
+      rawImuBuffer += row;
+      ++rawImuBufferedRows;
+      if (rawImuBufferedRows >= 32) {
+        if (rawImuFile.print(rawImuBuffer) == 0) {
+          markSdFailed(nowMs);
+          return;
+        }
+        rawImuFile.flush();
+        rawImuBuffer = "";
+        rawImuBufferedRows = 0;
+      }
+    }
+  }
+}
+#endif
+
 void closeCompletedDailyFile(time_t nowUtc) {
   if (currentLogPath.isEmpty() || currentLogPath == pathForLocalDay(nowUtc)) {
     return;
@@ -617,13 +795,19 @@ void closeCompletedDailyFile(time_t nowUtc) {
 
 void markSdFailed(uint32_t nowMs) {
   if (logFile) logFile.close();
+#if ENABLE_RAW_IMU_LOGGING
+  if (rawImuFile) rawImuFile.close();
+  currentRawImuPath = "";
+  rawImuBuffer = "";
+  rawImuBufferedRows = 0;
+#endif
   currentLogPath = "";
   sdMounted = false;
   lastSdAttemptMs = nowMs;
   SD.end();
 }
 
-bool mountSd(uint32_t nowMs, bool force = false) {
+bool mountSd(uint32_t nowMs, bool force) {
   if (sdMounted) return true;
   if (!force && nowMs - lastSdAttemptMs < config::kSdRetryIntervalMs) return false;
   lastSdAttemptMs = nowMs;
@@ -666,10 +850,15 @@ bool openDailyFile(time_t nowUtc, uint32_t nowMs) {
   return true;
 }
 
-bool writeCsvRow(const GpsSnapshot& gpsSample, uint32_t nowMs, time_t nowUtc) {
+bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
+                 time_t nowUtc) {
   if (!clockIsReady() || !openDailyFile(nowUtc, nowMs)) return false;
 
-  const ImuSample imuSample = imu.snapshotAndResetRoughness();
+  const GpsSnapshot& gpsSample = telemetryData.gps;
+  const ImuSample imuSample =
+      telemetryData.metadata.source == TelemetrySource::LocalGps
+          ? imu.snapshotAndResetRoughness()
+          : telemetryData.imu;
   char utcTimestamp[40]{};
   char localTimestamp[48]{};
   formatUtcTimestamp(utcTimestamp, sizeof(utcTimestamp));
@@ -689,23 +878,77 @@ bool writeCsvRow(const GpsSnapshot& gpsSample, uint32_t nowMs, time_t nowUtc) {
   }
   line.field(gpsSample.hdop, 2, gpsSample.hdopValid);
   line.field(gpsSample.vdop, 2, gpsSample.vdopValid);
-  line.field(imuSample.ax, 4, imuSample.valid);
-  line.field(imuSample.ay, 4, imuSample.valid);
-  line.field(imuSample.az, 4, imuSample.valid);
-  line.field(imuSample.gx, 3, imuSample.valid);
-  line.field(imuSample.gy, 3, imuSample.valid);
-  line.field(imuSample.gz, 3, imuSample.valid);
-  line.field(imuSample.pitch, 2, imuSample.valid);
-  line.field(imuSample.roll, 2, imuSample.valid);
-  line.field(imuSample.gTotal, 4, imuSample.valid);
-  line.field(imuSample.roughness, 5, imuSample.valid);
+  line.field(imuSample.axMps2 / kStandardGravityMps2, 4, imuSample.valid);
+  line.field(imuSample.ayMps2 / kStandardGravityMps2, 4, imuSample.valid);
+  line.field(imuSample.azMps2 / kStandardGravityMps2, 4, imuSample.valid);
+  line.field(imuSample.gxDps, 3, imuSample.valid);
+  line.field(imuSample.gyDps, 3, imuSample.valid);
+  line.field(imuSample.gzDps, 3, imuSample.valid);
+  line.field(imuSample.pitchDeg, 2, imuSample.valid);
+  line.field(imuSample.rollDeg, 2, imuSample.valid);
+  line.field(imuSample.gTotalMps2 / kStandardGravityMps2, 4,
+             imuSample.valid);
+  const float roughnessMps2 =
+      telemetryData.metadata.source == TelemetrySource::LocalGps
+          ? imuSample.legacyRoughnessMps2
+          : imuSample.vibrationRmsMps2;
+  line.field(roughnessMps2 / kStandardGravityMps2, 5, imuSample.valid);
   line.append(",%s,%u,", localTimestamp, gpsSample.fixValid ? 1U : 0U);
   if (gpsSample.fixAgeMs != UINT32_MAX) {
     line.append("%lu", static_cast<unsigned long>(gpsSample.fixAgeMs));
   }
-  line.append(",%u,%s,%s,%llu", imuSample.available ? 1U : 0U, imu.typeName(),
+  const char* imuType = telemetryData.metadata.source ==
+                                TelemetrySource::AtomS3Remote
+                            ? "MPU6886_REMOTE"
+                            : imu.typeName();
+  line.append(",%u,%s,%s,%llu", imuSample.available ? 1U : 0U, imuType,
               modeName(mode),
               static_cast<unsigned long long>(esp_timer_get_time() / 1000ULL));
+  line.append(",%s,", telemetrySourceName(telemetryData.metadata.source));
+  if (telemetryData.metadata.source == TelemetrySource::AtomS3Remote) {
+    line.append("%lu", static_cast<unsigned long>(
+                           telemetryData.metadata.remoteSequence));
+  }
+  line.field(imuSample.axMps2, 4, imuSample.valid);
+  line.field(imuSample.ayMps2, 4, imuSample.valid);
+  line.field(imuSample.azMps2, 4, imuSample.valid);
+  line.field(imuSample.accelRmsMps2, 4, imuSample.valid);
+  line.field(imuSample.verticalAccelRmsMps2, 4, imuSample.valid);
+  line.field(imuSample.verticalAccelPeakPosMps2, 4, imuSample.valid);
+  line.field(imuSample.verticalAccelPeakNegMps2, 4, imuSample.valid);
+  line.field(imuSample.lateralAccelPeakMps2, 4, imuSample.valid);
+  line.field(imuSample.longitudinalAccelPeakMps2, 4, imuSample.valid);
+  line.field(imuSample.vibrationRmsMps2, 4, imuSample.valid);
+  if (imuSample.valid) line.append(",%u", imuSample.sampleCount);
+  else line.append(",");
+  if (gpsSample.fixAgeMs != UINT32_MAX) {
+    line.append(",%lu", static_cast<unsigned long>(gpsSample.fixAgeMs));
+  } else {
+    line.append(",");
+  }
+  if (telemetryData.metadata.packetAgeMs != UINT32_MAX) {
+    line.append(",%lu", static_cast<unsigned long>(
+                            telemetryData.metadata.packetAgeMs));
+  } else {
+    line.append(",");
+  }
+  if (telemetryData.metadata.source == TelemetrySource::AtomS3Remote) {
+    line.append(",%lu,%lu,%lu,%u",
+                static_cast<unsigned long>(telemetryData.metadata.packetsLost),
+                static_cast<unsigned long>(telemetryData.metadata.duplicates),
+                static_cast<unsigned long>(telemetryData.metadata.crcErrors),
+                telemetryData.metadata.remoteTransmitFailures);
+  } else {
+    line.append(",,,,");
+  }
+  String poi;
+  String poiSource;
+  String waypointId;
+  currentPoi(gpsSample, poi, poiSource, waypointId);
+  const String escapedPoi = WaypointStore::csvField(poi);
+  const String escapedAutoPlace = WaypointStore::csvField(autoPlace);
+  line.append(",%s,%s,%s,%s", escapedPoi.c_str(), poiSource.c_str(),
+              escapedAutoPlace.c_str(), waypointId.c_str());
 
   const size_t written = logFile.println(line.c_str());
   logFile.flush();
@@ -730,6 +973,10 @@ bool logIsDue(uint32_t nowMs, time_t nowUtc) {
     default:
       return false;
   }
+}
+
+bool stationaryForFileWork() {
+  return mode == LogMode::StoppedFirstHour || mode == LogMode::StoppedHourly;
 }
 
 void onLogSucceeded(uint32_t nowMs, time_t nowUtc) {
@@ -820,9 +1067,218 @@ void cycleGpsPreference() {
   lastDisplayMs = 0;
 }
 
+void cycleTelemetrySource() {
+  telemetrySource = telemetrySource == TelemetrySource::LocalGps
+                        ? TelemetrySource::AtomS3Remote
+                        : TelemetrySource::LocalGps;
+  preferences.putUChar("tele_src", static_cast<uint8_t>(telemetrySource));
+  immediateLogRequested = true;
+  haveDashboardFrameHash = false;
+  lastDisplayMs = 0;
+}
+
+void setWaypointMessage(const String& message) {
+  waypointMessage = message;
+  waypointMessageStartedMs = millis();
+  haveDashboardFrameHash = false;
+  lastDisplayMs = 0;
+}
+
+bool createCurrentWaypoint(const String& category, WaypointRecord& created) {
+  const time_t nowUtc = time(nullptr);
+  if (!clockIsReady()) {
+    setWaypointMessage("WAIT FOR GPS/NTP TIME");
+    return false;
+  }
+  if (!activeTelemetry.gps.fixValid) {
+    setWaypointMessage("WAIT FOR GPS FIX");
+    return false;
+  }
+  if (!mountSd(millis())) {
+    setWaypointMessage("SD UNAVAILABLE");
+    return false;
+  }
+  char timestamp[40]{};
+  formatUtcTimestamp(timestamp, sizeof(timestamp));
+  if (!waypointStore.create(activeTelemetry.gps, activeTelemetry.metadata,
+                            vehicleContext, nowUtc, timestamp, category,
+                            created)) {
+    setWaypointMessage("WAYPOINT SAVE FAILED");
+    return false;
+  }
+  waypointShowLast = true;
+  setWaypointMessage("WAYPOINT SAVED " + created.id);
+  return true;
+}
+
+void handleDialCommand(const telemetry::DialCommandPacket& command) {
+  const auto action = static_cast<telemetry::DialAction>(command.action);
+  char textBuffer[sizeof(command.text) + 1]{};
+  std::memcpy(textBuffer, command.text, sizeof(command.text));
+  String value = WaypointStore::sanitizeText(textBuffer, 31);
+  bool accepted = false;
+  String waypointId;
+  if (action == telemetry::DialAction::MarkWaypoint) {
+    WaypointRecord created;
+    accepted = createCurrentWaypoint(value.isEmpty() ? "GENERIC" : value,
+                                     created);
+    if (accepted) waypointId = created.id;
+  } else if (action == telemetry::DialAction::SetRoad) {
+    vehicleContext.roadType = value;
+    preferences.putString("road", value);
+    accepted = true;
+  } else if (action == telemetry::DialAction::SetTyreFront ||
+             action == telemetry::DialAction::SetTyreRear) {
+    if (std::isfinite(command.value) && command.value >= 0.0f &&
+        command.value <= 100.0f) {
+      if (action == telemetry::DialAction::SetTyreFront) {
+        vehicleContext.tyreSetFrontPsi = command.value;
+        preferences.putFloat("tyre_f", command.value);
+      } else {
+        vehicleContext.tyreSetRearPsi = command.value;
+        preferences.putFloat("tyre_r", command.value);
+      }
+      accepted = true;
+    }
+  } else if (action == telemetry::DialAction::SetSuspensionFront) {
+    vehicleContext.suspensionFront = value;
+    preferences.putString("susp_f", value);
+    accepted = true;
+  } else if (action == telemetry::DialAction::SetSuspensionRear) {
+    vehicleContext.suspensionRear = value;
+    preferences.putString("susp_r", value);
+    accepted = true;
+  } else if (action == telemetry::DialAction::SetLoad) {
+    vehicleContext.vehicleLoad = value;
+    preferences.putString("load", value);
+    accepted = true;
+  }
+  if (accepted && action != telemetry::DialAction::MarkWaypoint &&
+      sdMounted && clockIsReady()) {
+    char timestamp[40]{};
+    formatUtcTimestamp(timestamp, sizeof(timestamp));
+    waypointStore.appendEvent("CONTEXT_CHANGED", "", String(command.action) +
+                                  ":" + value + ":" + String(command.value),
+                              telemetrySourceName(activeTelemetry.metadata.source),
+                              time(nullptr), timestamp);
+  }
+  telemetry::DialAckPacket ack{};
+  telemetry::preparePacket(ack, telemetry::PacketType::DialAck);
+  ack.command_sequence = command.sequence;
+  ack.accepted = accepted ? 1 : 0;
+  waypointId.toCharArray(ack.waypoint_id, sizeof(ack.waypoint_id));
+  telemetry::sealPacket(ack);
+  remoteReceiver.sendDialAck(ack);
+}
+
+void sendDialStatus(uint32_t nowMs) {
+  if (!remoteReceiver.dialConnected(nowMs)) return;
+  static uint32_t lastPreparedMs = 0;
+  if (nowMs - lastPreparedMs < 500) return;
+  lastPreparedMs = nowMs;
+  static uint32_t sequence = 0;
+  telemetry::DialStatusPacket status{};
+  telemetry::preparePacket(status, telemetry::PacketType::DialStatus);
+  status.sequence = sequence++;
+  status.uptime_ms = nowMs;
+  status.log_elapsed_s =
+      tripStartedMs == 0 ? 0 : (nowMs - tripStartedMs) / 1000;
+  const GpsSnapshot& gps = activeTelemetry.gps;
+  status.speed_kmh = gps.speedFresh ? gps.speedKmh : 0.0f;
+  status.front_psi = vehicleContext.tyreSetFrontPsi;
+  status.rear_psi = vehicleContext.tyreSetRearPsi;
+  status.fix_valid = gps.fixValid ? 1 : 0;
+  status.satellites = std::min(gps.satellites, static_cast<uint32_t>(255));
+  status.log_mode = static_cast<uint8_t>(mode);
+  status.source = static_cast<uint8_t>(activeTelemetry.metadata.source);
+  vehicleContext.roadType.toCharArray(status.road, sizeof(status.road));
+  vehicleContext.suspensionFront.toCharArray(
+      status.suspension_front, sizeof(status.suspension_front));
+  vehicleContext.suspensionRear.toCharArray(
+      status.suspension_rear, sizeof(status.suspension_rear));
+  vehicleContext.vehicleLoad.toCharArray(
+      status.vehicle_load, sizeof(status.vehicle_load));
+  String poi;
+  String poiSource;
+  String waypointId;
+  currentPoi(gps, poi, poiSource, waypointId);
+  poi.toCharArray(status.place, sizeof(status.place));
+  if (waypointStore.hasLast()) {
+    waypointStore.last().id.toCharArray(status.last_waypoint,
+                                        sizeof(status.last_waypoint));
+  }
+  telemetry::sealPacket(status);
+  remoteReceiver.sendDialStatus(status, nowMs);
+}
+
+void beginWaypointEdit(WaypointEditor field) {
+  if (!waypointStore.hasLast()) {
+    setWaypointMessage("NO WAYPOINT YET");
+    return;
+  }
+  waypointEditor = field;
+  const WaypointRecord& last = waypointStore.last();
+  waypointInput = field == WaypointEditor::Name
+                      ? (last.name == last.id ? "" : last.name)
+                      : field == WaypointEditor::Note
+                            ? last.note
+                            : last.photoReference;
+  haveDashboardFrameHash = false;
+  lastDisplayMs = 0;
+}
+
+void handleWaypointEditor() {
+  if (waypointEditor == WaypointEditor::Closed ||
+      !M5Cardputer.Keyboard.isChange() ||
+      !M5Cardputer.Keyboard.isPressed()) {
+    return;
+  }
+  auto& keys = M5Cardputer.Keyboard.keysState();
+  if (keys.esc) {
+    waypointEditor = WaypointEditor::Closed;
+    setWaypointMessage("EDIT CANCELLED");
+    return;
+  }
+  if (keys.del || keys.backspace) {
+    if (!waypointInput.isEmpty()) waypointInput.remove(waypointInput.length() - 1);
+  } else if (keys.enter) {
+    char timestamp[40]{};
+    formatUtcTimestamp(timestamp, sizeof(timestamp));
+    const time_t nowUtc = time(nullptr);
+    bool saved = false;
+    if (mountSd(millis())) {
+      switch (waypointEditor) {
+        case WaypointEditor::Name:
+          saved = waypointStore.editName(waypointInput, nowUtc, timestamp);
+          break;
+        case WaypointEditor::Note:
+          saved = waypointStore.editNote(waypointInput, nowUtc, timestamp);
+          break;
+        case WaypointEditor::Photo:
+          saved = waypointStore.editPhoto(waypointInput, nowUtc, timestamp);
+          break;
+        default:
+          break;
+      }
+    }
+    waypointEditor = WaypointEditor::Closed;
+    setWaypointMessage(saved ? "WAYPOINT UPDATED" : "EDIT SAVE FAILED");
+    return;
+  } else {
+    for (char c : keys.word) {
+      if (c >= 32 && c <= 126 && waypointInput.length() < 64) {
+        waypointInput += c;
+      }
+    }
+  }
+  haveDashboardFrameHash = false;
+  lastDisplayMs = 0;
+}
+
 void selectDashboardPage(DashboardPage page) {
   dashboardPage = page;
   preferences.putUChar("page", static_cast<uint8_t>(page));
+  haveDashboardFrameHash = false;
   lastDisplayMs = 0;
 }
 
@@ -836,7 +1292,14 @@ void moveDashboardPage(int direction) {
 void handleControls() {
   if (wifiSetup.active()) {
     wifiSetup.handleInput(locationTime);
-    if (!wifiSetup.active()) lastDisplayMs = 0;
+    if (!wifiSetup.active()) {
+      haveDashboardFrameHash = false;
+      lastDisplayMs = 0;
+    }
+    return;
+  }
+  if (waypointEditor != WaypointEditor::Closed) {
+    handleWaypointEditor();
     return;
   }
 
@@ -850,6 +1313,7 @@ void handleControls() {
     if (screenOn) {
       M5Cardputer.Display.wakeup();
       M5Cardputer.Display.setBrightness(displayBrightness);
+      haveDashboardFrameHash = false;
       lastDisplayMs = 0;
     } else {
       M5Cardputer.Display.sleep();
@@ -861,11 +1325,33 @@ void handleControls() {
     moveDashboardPage(-1);
   } else if (M5Cardputer.Keyboard.isKeyPressed('g')) {
     cycleGpsPreference();
+  } else if (M5Cardputer.Keyboard.isKeyPressed('r')) {
+    cycleTelemetrySource();
+  } else if (M5Cardputer.Keyboard.isKeyPressed('p')) {
+    selectDashboardPage(DashboardPage::Waypoint);
+  } else if (dashboardPage == DashboardPage::Waypoint &&
+             M5Cardputer.Keyboard.isKeyPressed('a')) {
+    WaypointRecord created;
+    createCurrentWaypoint("GENERIC", created);
+  } else if (dashboardPage == DashboardPage::Waypoint &&
+             M5Cardputer.Keyboard.isKeyPressed('n')) {
+    beginWaypointEdit(WaypointEditor::Name);
+  } else if (dashboardPage == DashboardPage::Waypoint &&
+             M5Cardputer.Keyboard.isKeyPressed('t')) {
+    beginWaypointEdit(WaypointEditor::Note);
+  } else if (dashboardPage == DashboardPage::Waypoint &&
+             M5Cardputer.Keyboard.isKeyPressed('f')) {
+    beginWaypointEdit(WaypointEditor::Photo);
+  } else if (dashboardPage == DashboardPage::Waypoint &&
+             M5Cardputer.Keyboard.isKeyPressed('v')) {
+    waypointShowLast = !waypointShowLast;
+    lastDisplayMs = 0;
   } else if (M5Cardputer.Keyboard.isKeyPressed('w')) {
     if (!screenOn) {
       screenOn = true;
       M5Cardputer.Display.wakeup();
       M5Cardputer.Display.setBrightness(displayBrightness);
+      haveDashboardFrameHash = false;
     }
     wifiSetup.open();
   } else if (M5Cardputer.Keyboard.isKeyPressed('k')) {
@@ -947,7 +1433,8 @@ void drawCombinedPage(const GpsSnapshot& sample) {
   display.setCursor(3, 73);
   display.printf("GPS:%s SAT:%lu\n", sample.fixValid ? "FIX" : "WAIT",
                  static_cast<unsigned long>(sample.satellites));
-  display.printf("IMU:%s  SD:%s\n", imu.available() ? "OK" : "N/A",
+  display.printf("IMU:%s  SD:%s\n",
+                 activeTelemetry.imu.available ? "OK" : "N/A",
                  sdMounted ? "OK" : "ERR");
   drawPageFooter();
 }
@@ -1052,8 +1539,13 @@ void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
   } else {
     display.println("LAT --\nLON --");
   }
-  display.printf("%s %s H:", activeGps->name(),
-                 activeGps->live(nowMs) ? "LIVE" : "SCAN");
+  if (telemetrySource == TelemetrySource::AtomS3Remote) {
+    display.printf("ATOM %s H:",
+                   activeTelemetry.metadata.remoteConnected ? "LIVE" : "LOST");
+  } else {
+    display.printf("%s %s H:", activeGps->name(),
+                   activeGps->live(nowMs) ? "LIVE" : "SCAN");
+  }
   if (sample.hdopValid) display.printf("%.1f", sample.hdop);
   else display.print("--");
   display.println();
@@ -1066,23 +1558,29 @@ void drawImuStatusPage() {
   drawPageTitle("IMU STATUS");
   display.setTextSize(2);
   display.setCursor(3, 27);
-  if (!imu.available()) {
+  const ImuSample& value = activeTelemetry.imu;
+  if (!value.available) {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
     display.println("IMU unavailable");
     display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.println("Original Cardputer");
-    display.println("logs N/A fields");
+    display.println(telemetrySource == TelemetrySource::AtomS3Remote
+                        ? "REMOTE GPS/IMU LOST"
+                        : "Local IMU N/A");
   } else {
-    const ImuSample& value = imu.latest();
     display.setTextColor(value.valid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-    display.printf("%s %s\n", imu.typeName(), value.valid ? "LIVE" : "WAIT");
+    display.printf("%s %s\n",
+                   telemetrySource == TelemetrySource::AtomS3Remote
+                       ? "ATOM MPU6886"
+                       : imu.typeName(),
+                   value.valid ? "LIVE" : "WAIT");
     display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.printf("X:%+.2f Y:%+.2f\n", value.ax, value.ay);
-    display.printf("Z:%+.2f G:%.2f\n", value.az, value.gTotal);
-    display.printf("P:%+.1f R:%+.1f\n", value.pitch, value.roll);
+    display.printf("X:%+.1f Y:%+.1f\n", value.axMps2, value.ayMps2);
+    display.printf("Z:%+.1f V:%.2f\n", value.azMps2,
+                   value.vibrationRmsMps2);
+    display.printf("P:%+.1f R:%+.1f\n", value.pitchDeg, value.rollDeg);
     display.setTextSize(1);
-    display.printf("GYRO  X:%+.1f Y:%+.1f Z:%+.1f", value.gx, value.gy,
-                   value.gz);
+    display.printf("m/s2; gyro X:%+.1f Y:%+.1f Z:%+.1f", value.gxDps,
+                   value.gyDps, value.gzDps);
   }
   drawPageFooter();
 }
@@ -1093,15 +1591,35 @@ void drawGpsSetupPage(uint32_t nowMs) {
   display.setTextSize(2);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.setCursor(3, 27);
-  display.printf("Preferred: %s\n", gpsPreferenceName());
-  display.printf("Active: %s\n", activeGps->name());
-  display.printf("Baud: %lu\n", static_cast<unsigned long>(activeGps->baud()));
-  display.setTextColor(activeGps->live(nowMs) ? TFT_GREEN : TFT_ORANGE,
-                       TFT_BLACK);
-  display.printf("Signal: %s\n", activeGps->live(nowMs) ? "NMEA LIVE" : "SCANNING");
+  display.printf("Source: %s\n",
+                 telemetrySource == TelemetrySource::AtomS3Remote ? "ATOM REMOTE"
+                                                                  : "LOCAL GPS");
+  if (telemetrySource == TelemetrySource::AtomS3Remote) {
+    display.setTextColor(activeTelemetry.metadata.remoteConnected ? TFT_GREEN
+                                                                  : TFT_ORANGE,
+                         TFT_BLACK);
+    display.printf("Remote: %s\n", remoteReceiver.statusText(nowMs));
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.printf("Seq:%lu Age:", static_cast<unsigned long>(
+                                      activeTelemetry.metadata.remoteSequence));
+    if (activeTelemetry.metadata.packetAgeMs == UINT32_MAX) display.println("--");
+    else display.printf("%lums\n", static_cast<unsigned long>(
+                                     activeTelemetry.metadata.packetAgeMs));
+    display.setTextSize(1);
+    display.println(displayClip(remoteReceiver.peerMacText(), 24));
+    display.setTextSize(2);
+  } else {
+    display.printf("Preferred: %s\n", gpsPreferenceName());
+    display.printf("Active: %s %lu\n", activeGps->name(),
+                   static_cast<unsigned long>(activeGps->baud()));
+    display.setTextColor(activeGps->live(nowMs) ? TFT_GREEN : TFT_ORANGE,
+                         TFT_BLACK);
+    display.printf("Signal: %s\n",
+                   activeGps->live(nowMs) ? "NMEA LIVE" : "SCANNING");
+  }
   display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.println("Press G to change");
-  drawPageFooter();
+  display.println("R:source G:local");
+  drawPageFooter("R:source  G:GPS");
 }
 
 void drawWifiPage() {
@@ -1114,8 +1632,14 @@ void drawWifiPage() {
     display.println("CONNECTED");
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.println(displayClip(WiFi.SSID(), 18));
-    display.printf("Signal: %ld dBm\n", static_cast<long>(WiFi.RSSI()));
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.println("WEB: HTTP PORT 80");
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+    display.setTextSize(1);
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.println("http://jp226-logger.local");
+    display.setTextSize(2);
   } else {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
     display.println("OFFLINE");
@@ -1124,7 +1648,7 @@ void drawWifiPage() {
     display.println(saved.isEmpty() ? "No saved network" : displayClip(saved, 18));
   }
   display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.println("Press W for setup");
+  display.println("W: WI-FI SETUP");
   drawPageFooter();
 }
 
@@ -1193,9 +1717,12 @@ void drawKmlExportPage() {
   drawPageTitle("KML EXPORT");
   display.setTextSize(2);
   display.setCursor(3, 25);
-  display.setTextColor(kmlExporter.failedCount() == 0 ? TFT_GREEN : TFT_ORANGE,
+  const bool stationary = stationaryForFileWork();
+  display.setTextColor(kmlExporter.failedCount() == 0 && stationary
+                           ? TFT_GREEN
+                           : TFT_ORANGE,
                        TFT_BLACK);
-  display.printf("%s\n", kmlExporter.phaseName());
+  display.printf("%s\n", stationary ? kmlExporter.phaseName() : "WAITING TO STOP");
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.printf("Done:%u  Err:%u\n", kmlExporter.completedCount(),
                  kmlExporter.failedCount());
@@ -1210,6 +1737,64 @@ void drawKmlExportPage() {
   display.setTextColor(TFT_CYAN, TFT_BLACK);
   display.drawString("K: SCAN OLD DAYS", 3, 105);
   drawPageFooter();
+}
+
+void drawWaypointPage(const GpsSnapshot& gps, uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("WAYPOINT");
+  display.setTextSize(1);
+  display.setCursor(3, 23);
+  display.setTextColor(gps.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.printf("GPS %s  SAT %lu  HDOP ", gps.fixValid ? "FIX" : "WAIT",
+                 static_cast<unsigned long>(gps.satellites));
+  if (gps.hdopValid) display.printf("%.1f\n", gps.hdop);
+  else display.println("--");
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (gps.positionFresh) {
+    display.printf("LAT %.7f  LON %.7f\n", gps.latitude, gps.longitude);
+  } else {
+    display.println("LAT --  LON --");
+  }
+  String poi;
+  String poiSource;
+  String waypointId;
+  currentPoi(gps, poi, poiSource, waypointId);
+  display.printf("POI: %s\n", displayClip(poi.isEmpty() ? "--" : poi, 31).c_str());
+  if (waypointStore.hasLast()) {
+    const auto& last = waypointStore.last();
+    display.printf("LAST %s  %s\n", last.id.c_str(),
+                   displayClip(last.name, 23).c_str());
+    if (gps.positionFresh) {
+      display.printf("DIST %.0f m  CAT %s\n",
+                     waypointStore.distanceFromLastM(gps.latitude,
+                                                     gps.longitude),
+                     displayClip(last.category, 13).c_str());
+    }
+    if (waypointShowLast) {
+      display.printf("AT %s\n", displayClip(last.timestamp, 27).c_str());
+      display.printf("NOTE %s\n", displayClip(last.note, 27).c_str());
+      display.printf("PHOTO %s\n", displayClip(last.photoReference, 26).c_str());
+    }
+  }
+  if (waypointEditor != WaypointEditor::Closed) {
+    const char* label = waypointEditor == WaypointEditor::Name
+                            ? "NAME"
+                            : waypointEditor == WaypointEditor::Note ? "NOTE"
+                                                                      : "PHOTO";
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.printf("%s: %s_\n", label,
+                   displayClip(waypointInput, 27).c_str());
+    display.println("Enter: save  Esc: cancel");
+  } else {
+    if (nowMs - waypointMessageStartedMs < 5000 &&
+        !waypointMessage.isEmpty()) {
+      display.setTextColor(TFT_GREEN, TFT_BLACK);
+      display.println(displayClip(waypointMessage, 32));
+    }
+    display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.println("A:add N:name T:note F:photo V:last");
+  }
+  drawPageFooter("P:waypoint  [ ]:pages");
 }
 
 void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
@@ -1265,13 +1850,21 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
     case DashboardPage::KmlExport:
       drawKmlExportPage();
       break;
+    case DashboardPage::Waypoint:
+      drawWaypointPage(sample, nowMs);
+      break;
     default:
       break;
   }
   display.setTextDatum(top_left);
   display.setTextSize(1);
   display.endWrite();
-  display.pushSprite(0, 0);
+  const uint32_t frameHash = frameBufferHash(display);
+  if (!haveDashboardFrameHash || frameHash != lastDashboardFrameHash) {
+    display.pushSprite(0, 0);
+    lastDashboardFrameHash = frameHash;
+    haveDashboardFrameHash = true;
+  }
 }
 
 void loadPersistentState() {
@@ -1286,6 +1879,17 @@ void loadPersistentState() {
        isCardputerAdv())) {
     gpsPreference = static_cast<GpsPreference>(savedGpsPreference);
   }
+  const uint8_t defaultSource = config::kDefaultToAtomS3Remote
+                                    ? static_cast<uint8_t>(
+                                          TelemetrySource::AtomS3Remote)
+                                    : static_cast<uint8_t>(
+                                          TelemetrySource::LocalGps);
+  const uint8_t savedTelemetrySource =
+      preferences.getUChar("tele_src", defaultSource);
+  if (savedTelemetrySource <=
+      static_cast<uint8_t>(TelemetrySource::AtomS3Remote)) {
+    telemetrySource = static_cast<TelemetrySource>(savedTelemetrySource);
+  }
   if (preferences.getUChar("state", 0) == 2) {
     persistedStopStartUtc =
         static_cast<time_t>(preferences.getULong64("stop_utc", 0));
@@ -1293,6 +1897,12 @@ void loadPersistentState() {
         static_cast<time_t>(preferences.getULong64("next_utc", 0));
     persistedStopPending = persistedStopStartUtc > 0 && persistedNextDueUtc > 0;
   }
+  vehicleContext.roadType = preferences.getString("road", "");
+  vehicleContext.tyreSetFrontPsi = preferences.getFloat("tyre_f", NAN);
+  vehicleContext.tyreSetRearPsi = preferences.getFloat("tyre_r", NAN);
+  vehicleContext.suspensionFront = preferences.getString("susp_f", "");
+  vehicleContext.suspensionRear = preferences.getString("susp_r", "");
+  vehicleContext.vehicleLoad = preferences.getString("load", "");
 }
 
 }  // namespace
@@ -1320,8 +1930,12 @@ void setup() {
 
   imu.begin();
   loadPersistentState();
+  waypointStore.begin(SD, preferences, config::kLogDirectory);
+  remoteReceiver.begin(config::kAtomEspNowMac);
   kmlExporter.begin(SD, config::kLogDirectory, config::kFilePrefix,
                     config::kKmlDirectory);
+  webPortal.begin(SD, config::kLogDirectory, config::kKmlDirectory,
+                  config::kWebHostname);
 
   groveBaudIndex = 0;
   groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
@@ -1337,6 +1951,8 @@ void setup() {
   if (mountSd(millis(), true)) {
     locationTime.begin(SD, preferences);
     locationTimeStarted = true;
+    placeResolver.begin(SD, config::kLoggerConfigPath);
+    placeResolverStarted = true;
   }
 }
 
@@ -1347,28 +1963,65 @@ void loop() {
   const uint32_t nowMs = millis();
   updateGpsReceivers(nowMs);
   imu.update(nowMs);
-  syncClockFromGps(*activeGps, nowMs);
+  remoteReceiver.update(nowMs);
 
-  const GpsSnapshot gpsSample = takeGpsSnapshot(*activeGps);
+  activeTelemetry = telemetrySource == TelemetrySource::AtomS3Remote
+                        ? remoteReceiver.snapshot(nowMs)
+                        : takeLocalTelemetry();
+  telemetry::DialCommandPacket dialCommand{};
+  if (remoteReceiver.popDialCommand(dialCommand)) {
+    handleDialCommand(dialCommand);
+  }
+  const GpsSnapshot& gpsSample = activeTelemetry.gps;
+  if (gpsSample.fixValid && tripStartedMs == 0) tripStartedMs = nowMs;
+  syncClockFromTelemetry(gpsSample, nowMs);
   if (!wifiSetup.active()) {
     locationTime.update(gpsSample.latitude, gpsSample.longitude,
                         gpsSample.positionFresh, gpsSample.speedKmh, nowMs);
   }
   wifiSetup.update(nowMs);
+  placeResolver.update(gpsSample.latitude, gpsSample.longitude,
+                       gpsSample.positionFresh, nowMs);
+  String resolvedPlace;
+  if (placeResolver.takeChange(resolvedPlace)) {
+    if (clockIsReady() && sdMounted) {
+      char eventTimestamp[32];
+      formatUtcTimestamp(eventTimestamp, sizeof(eventTimestamp));
+      if (!autoPlace.isEmpty()) {
+        waypointStore.appendEvent("PLACE_EXIT", "", autoPlace,
+                                  telemetrySourceName(activeTelemetry.metadata.source),
+                                  time(nullptr), eventTimestamp);
+      }
+      if (!resolvedPlace.isEmpty()) {
+        waypointStore.appendEvent("PLACE_ENTER", "", resolvedPlace,
+                                  telemetrySourceName(activeTelemetry.metadata.source),
+                                  time(nullptr), eventTimestamp);
+      }
+    }
+    autoPlace = resolvedPlace;
+  }
   syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
   if (clockIsReady()) closeCompletedDailyFile(nowUtc);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
+  sendDialStatus(nowMs);
 
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&
-      writeCsvRow(gpsSample, nowMs, nowUtc)) {
+      writeCsvRow(activeTelemetry, nowMs, nowUtc)) {
     onLogSucceeded(nowMs, nowUtc);
   }
+#if ENABLE_RAW_IMU_LOGGING
+  writeRawImuBatches(nowUtc, nowMs);
+#endif
 
   mountSd(nowMs);
   if (sdMounted && !locationTimeStarted) {
     locationTime.begin(SD, preferences);
     locationTimeStarted = true;
+  }
+  if (sdMounted && !placeResolverStarted) {
+    placeResolver.begin(SD, config::kLoggerConfigPath);
+    placeResolverStarted = true;
   }
   if (sdMounted && clockIsReady()) {
     const String currentDate = localDateText(nowUtc);
@@ -1376,8 +2029,27 @@ void loop() {
       lastKmlScanDate = currentDate;
       kmlExporter.requestScan();
     }
-    kmlExporter.update(currentLogPath, currentDate);
+    if (webPortal.takeConversionRequest()) kmlExporter.requestScan();
+    if (stationaryForFileWork()) {
+      kmlExporter.update(currentLogPath, currentDate);
+    }
   }
+
+  WebPortalStatus webStatus;
+  webStatus.sdMounted = sdMounted;
+  webStatus.stationary = stationaryForFileWork();
+  webStatus.fixValid = gpsSample.fixValid;
+  webStatus.speedKmh = gpsSample.speedFresh ? gpsSample.speedKmh : 0.0;
+  webStatus.logState = modeName(mode);
+  webStatus.activeCsvPath = currentLogPath;
+  webStatus.timezone = locationTime.zoneName();
+  webStatus.kmlPhase = kmlExporter.phaseName();
+  webStatus.kmlMessage = kmlExporter.lastMessage();
+  webStatus.kmlQueued = kmlExporter.queuedCount();
+  webStatus.kmlCompleted = kmlExporter.completedCount();
+  webStatus.kmlFailed = kmlExporter.failedCount();
+  webStatus.kmlPoints = kmlExporter.pointsWritten();
+  webPortal.update(webStatus);
   drawStatus(gpsSample, nowMs, nowUtc);
   wifiSetup.draw(nowMs);
   delay(2);
