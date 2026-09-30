@@ -364,6 +364,10 @@ String waypointMessage;
 uint32_t waypointMessageStartedMs = 0;
 bool waypointShowLast = false;
 String autoPlace;
+int8_t batteryPercent = telemetry::kBatteryUnknown;
+uint16_t batteryMv = 0;
+uint32_t lastBatteryMs = 0;
+uint32_t lastBeaconInfoMs = 0;
 
 uint32_t frameBufferHash(const M5Canvas& canvas) {
   const auto* bytes = static_cast<const uint8_t*>(canvas.getBuffer());
@@ -1077,6 +1081,59 @@ void cycleTelemetrySource() {
   lastDisplayMs = 0;
 }
 
+// Cardputer and Cardputer ADV measure the battery through an ADC divider.
+// M5Unified cannot report charging on these boards.
+void updateBattery(uint32_t nowMs) {
+  if (lastBatteryMs != 0 && nowMs - lastBatteryMs < 5000) return;
+  lastBatteryMs = nowMs;
+  const int32_t level = M5.Power.getBatteryLevel();
+  const int32_t millivolts = M5.Power.getBatteryVoltage();
+  if (level < 0 || level > 100 || millivolts <= 0) {
+    batteryPercent = telemetry::kBatteryUnknown;
+    batteryMv = 0;
+    return;
+  }
+  batteryPercent = static_cast<int8_t>(level);
+  batteryMv = static_cast<uint16_t>(millivolts);
+}
+
+uint16_t batteryColor(int8_t percent) {
+  if (percent < 20) return TFT_RED;
+  if (percent < 50) return TFT_ORANGE;
+  return TFT_GREEN;
+}
+
+// Minutes east of UTC for the current local zone, from strftime("%z").
+bool localUtcOffsetMinutes(time_t nowUtc, int16_t& minutes) {
+  struct tm local {};
+  if (localtime_r(&nowUtc, &local) == nullptr) return false;
+  char offset[8]{};
+  if (strftime(offset, sizeof(offset), "%z", &local) != 5) return false;
+  const int hours = (offset[1] - '0') * 10 + (offset[2] - '0');
+  const int mins = (offset[3] - '0') * 10 + (offset[4] - '0');
+  minutes = static_cast<int16_t>((offset[0] == '-' ? -1 : 1) *
+                                 (hours * 60 + mins));
+  return true;
+}
+
+void updateBeaconInfo(uint32_t nowMs) {
+  if (lastBeaconInfoMs != 0 && nowMs - lastBeaconInfoMs < 1000) return;
+  lastBeaconInfoMs = nowMs;
+  uint8_t flags = 0;
+  uint32_t utc = 0;
+  int16_t offset = 0;
+  if (clockIsReady()) {
+    const time_t nowUtc = time(nullptr);
+    utc = static_cast<uint32_t>(nowUtc);
+    flags |= telemetry::UtcValid;
+    if (localUtcOffsetMinutes(nowUtc, offset)) {
+      flags |= telemetry::UtcOffsetValid;
+    }
+  }
+  remoteReceiver.setBeaconInfo(utc, offset, flags, batteryPercent,
+                               batteryMv);
+}
+
 void setWaypointMessage(const String& message) {
   waypointMessage = message;
   waypointMessageStartedMs = millis();
@@ -1191,6 +1248,7 @@ void sendDialStatus(uint32_t nowMs) {
   status.satellites = std::min(gps.satellites, static_cast<uint32_t>(255));
   status.log_mode = static_cast<uint8_t>(mode);
   status.source = static_cast<uint8_t>(activeTelemetry.metadata.source);
+  status.battery_percent = batteryPercent;
   vehicleContext.roadType.toCharArray(status.road, sizeof(status.road));
   vehicleContext.suspensionFront.toCharArray(
       status.suspension_front, sizeof(status.suspension_front));
@@ -1401,6 +1459,15 @@ void drawPageTitle(const char* title, uint16_t color = TFT_CYAN) {
   display.setTextColor(color, TFT_BLACK);
   display.drawString(title, 2, 1);
   display.drawFastHLine(0, 19, display.width(), color);
+  if (batteryPercent >= 0) {
+    char battery[8]{};
+    snprintf(battery, sizeof(battery), "%d%%", batteryPercent);
+    display.setTextSize(1);
+    display.setTextDatum(top_right);
+    display.setTextColor(batteryColor(batteryPercent), TFT_BLACK);
+    display.drawString(battery, display.width() - 2, 6);
+    display.setTextDatum(top_left);
+  }
 }
 
 void drawPageFooter(const char* hint = "[ ]/Tab: pages") {
@@ -1667,6 +1734,11 @@ void drawLoggerPage(time_t nowUtc) {
     display.println(displayClip(currentLogPath.substring(slash + 1), 19));
   } else {
     display.println("Waiting for clock");
+  }
+  if (batteryPercent >= 0) {
+    display.setTextColor(batteryColor(batteryPercent), TFT_BLACK);
+    display.printf("BAT %d%% %.2fV\n", batteryPercent, batteryMv / 1000.0f);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
   }
   if (nextStoppedDueUtc > nowUtc) {
     display.setTextSize(1);
@@ -2004,6 +2076,8 @@ void loop() {
   const time_t nowUtc = time(nullptr);
   if (clockIsReady()) closeCompletedDailyFile(nowUtc);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
+  updateBattery(nowMs);
+  updateBeaconInfo(nowMs);
   sendDialStatus(nowMs);
 
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&

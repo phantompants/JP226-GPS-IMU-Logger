@@ -151,7 +151,10 @@ for the packed wire format.
 | `S` | Turn the display off/on without stopping GPS monitoring |
 | `-` / `=` | Decrease/increase display brightness |
 
-The selected page is remembered across restarts. The eleven pages are:
+The selected page is remembered across restarts. The Cardputer battery
+percentage appears at the top right of each titled page, and the Logger page
+also shows its voltage. M5Unified reads the battery through an ADC divider and
+cannot detect charging. The eleven pages are:
 
 1. Combined GPS/IMU summary
 2. Large current speed

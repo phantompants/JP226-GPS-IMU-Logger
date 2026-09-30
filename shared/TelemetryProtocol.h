@@ -7,7 +7,7 @@
 namespace telemetry {
 
 constexpr std::uint32_t kMagic = 0x4A503232U;  // "JP22"
-constexpr std::uint8_t kProtocolVersion = 1;
+constexpr std::uint8_t kProtocolVersion = 2;
 constexpr std::size_t kEspNowV1PayloadLimit = 250;
 
 enum class PacketType : std::uint8_t {
@@ -43,6 +43,15 @@ enum StatusFlag : std::uint16_t {
   ImuCalibrated = 1U << 9,
   ImuStatisticsValid = 1U << 10,
 };
+
+// DiscoveryPacket::time_flags
+enum TimeFlag : std::uint8_t {
+  UtcValid = 1U << 0,
+  UtcOffsetValid = 1U << 1,
+};
+
+// Battery percentage used when the sender cannot measure a battery.
+constexpr std::int8_t kBatteryUnknown = -1;
 
 #pragma pack(push, 1)
 
@@ -89,10 +98,17 @@ struct TelemetryPacket {
   std::uint32_t crc32;
 };
 
+// The Cardputer beacon also shares its clock, local UTC offset and battery so
+// nodes without a fix or a battery gauge can display them.
 struct DiscoveryPacket {
   PacketHeader header;
   std::uint32_t sequence;
   std::uint32_t uptime_ms;
+  std::uint32_t utc_epoch_s;
+  std::int16_t utc_offset_min;
+  std::uint8_t time_flags;
+  std::int8_t battery_percent;
+  std::uint16_t battery_mv;
   std::uint32_t crc32;
 };
 
@@ -124,6 +140,8 @@ struct DialStatusPacket {
   char vehicle_load[12];
   char place[32];
   char last_waypoint[24];
+  std::int8_t battery_percent;
+  std::uint8_t reserved0[3];
   std::uint32_t crc32;
 };
 

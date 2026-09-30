@@ -17,6 +17,10 @@ class RemoteTelemetryReceiver {
                       uint32_t nowMs);
   void sendDialAck(const telemetry::DialAckPacket& packet);
   bool dialConnected(uint32_t nowMs) const;
+  // Clock, UTC offset and battery copied into each discovery beacon.
+  void setBeaconInfo(uint32_t utcEpochS, int16_t utcOffsetMin,
+                     uint8_t timeFlags, int8_t batteryPercent,
+                     uint16_t batteryMv);
   bool ready() const { return ready_; }
   const char* statusText(uint32_t nowMs) const;
   String peerMacText() const;
@@ -60,6 +64,12 @@ class RemoteTelemetryReceiver {
   uint32_t lastDialStatusMs_ = 0;
   uint32_t lastDialCommandSequence_ = 0;
   uint32_t discoverySequence_ = 0;
+  uint32_t beaconUtcEpochS_ = 0;
+  uint32_t beaconUtcSetMs_ = 0;
+  int16_t beaconUtcOffsetMin_ = 0;
+  uint8_t beaconTimeFlags_ = 0;
+  int8_t beaconBatteryPercent_ = telemetry::kBatteryUnknown;
+  uint16_t beaconBatteryMv_ = 0;
   uint32_t packetsLost_ = 0;
   uint32_t duplicates_ = 0;
   uint32_t crcErrors_ = 0;

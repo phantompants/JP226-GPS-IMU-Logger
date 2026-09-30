@@ -94,6 +94,16 @@ portMUX_TYPE beaconMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t beaconMac[6]{};
 uint8_t beaconChannel = 0;
 bool beaconPending = false;
+telemetry::DiscoveryPacket beaconPacket{};
+// Latest beacon from the paired Cardputer: its clock, zone and battery.
+telemetry::DiscoveryPacket hostBeacon{};
+bool haveHostBeacon = false;
+uint32_t hostBeaconMs = 0;
+
+enum class Page : uint8_t { Combined, Imu, Gps, Time, Power, Count };
+Page page = Page::Combined;
+M5Canvas canvas(&M5.Display);
+bool canvasReady = false;
 
 #if ENABLE_RAW_IMU_LOGGING
 telemetry::RawImuBatchPacket rawBatch{};
@@ -300,10 +310,12 @@ void processBeacon(uint32_t nowMs) {
   uint8_t mac[6]{};
   uint8_t channel = 0;
   bool pending = false;
+  telemetry::DiscoveryPacket beacon{};
   portENTER_CRITICAL(&beaconMux);
   if (beaconPending) {
     std::memcpy(mac, beaconMac, 6);
     channel = beaconChannel;
+    beacon = beaconPacket;
     beaconPending = false;
     pending = true;
   }
@@ -313,6 +325,9 @@ void processBeacon(uint32_t nowMs) {
     if (std::memcmp(mac, peerMac, 6) != 0) return;
     peerChannel = channel;
     lastPeerSeenMs = nowMs;
+    hostBeacon = beacon;
+    haveHostBeacon = true;
+    hostBeaconMs = nowMs;
     return;
   }
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
@@ -328,6 +343,9 @@ void processBeacon(uint32_t nowMs) {
   scanChannel = channel;
   havePeer = true;
   lastPeerSeenMs = nowMs;
+  hostBeacon = beacon;
+  haveHostBeacon = true;
+  hostBeaconMs = nowMs;
 }
 
 void receiveCallback(const esp_now_recv_info_t* info, const uint8_t* data,
@@ -347,6 +365,7 @@ void receiveCallback(const esp_now_recv_info_t* info, const uint8_t* data,
   portENTER_CRITICAL(&beaconMux);
   std::memcpy(beaconMac, info->src_addr, 6);
   beaconChannel = channel;
+  beaconPacket = packet;
   beaconPending = true;
   portEXIT_CRITICAL(&beaconMux);
 }
@@ -467,41 +486,294 @@ void sendTelemetry(uint32_t nowMs) {
   }
 }
 
+constexpr uint16_t kAxisXColor = TFT_RED;
+constexpr uint16_t kAxisYColor = TFT_GREEN;
+constexpr uint16_t kAxisZColor = 0x54BF;  // Light blue; pure blue is dim.
+constexpr uint32_t kHostBeaconFreshMs = 10'000;
+constexpr uint32_t kHostClockValidMs = 10UL * 60UL * 1000UL;
+
+// Pages use double-size text (12 x 16 px, 10 characters per row). Frames are
+// drawn off-screen and pushed in one transfer so the panel never flickers.
+class ScreenRows {
+ public:
+  ScreenRows(M5Canvas& display, int top, int pitch)
+      : display_(display), y_(top), pitch_(pitch) {}
+
+  template <typename... Values>
+  void line(uint16_t color, const char* format, Values... values) {
+    char text[24]{};
+    snprintf(text, sizeof(text), format, values...);
+    display_.setTextSize(2);
+    display_.setTextColor(color, TFT_BLACK);
+    display_.drawString(text, 2, y_);
+    y_ += pitch_;
+  }
+
+ private:
+  M5Canvas& display_;
+  int y_;
+  int pitch_;
+};
+
+bool gpsNmeaLive(uint32_t nowMs) {
+  return lastGpsSentenceMs != 0 &&
+         nowMs - lastGpsSentenceMs <= atom_config::kGpsFreshMs;
+}
+
+bool gpsPositionFresh() {
+  return gps.location.isValid() &&
+         gps.location.age() <= atom_config::kGpsFreshMs;
+}
+
+bool hostBeaconFresh(uint32_t nowMs) {
+  return haveHostBeacon && nowMs - hostBeaconMs <= kHostBeaconFreshMs;
+}
+
+uint16_t batteryColor(int percent) {
+  if (percent < 20) return TFT_RED;
+  if (percent < 50) return TFT_ORANGE;
+  return TFT_GREEN;
+}
+
+void drawGpsStatusRow(ScreenRows& rows, uint32_t nowMs) {
+  const unsigned long satellites =
+      gps.satellites.isValid() ? gps.satellites.value() : 0;
+  if (!gpsNmeaLive(nowMs)) {
+    rows.line(TFT_RED, "NO GPS");
+  } else {
+    rows.line(gpsPositionFresh() ? TFT_GREEN : TFT_ORANGE, "%s %lusat",
+              gpsPositionFresh() ? "FIX" : "WAIT", satellites);
+  }
+}
+
+void drawTitle(const char* title, uint16_t color) {
+  canvas.setTextSize(1);
+  canvas.setTextColor(color, TFT_BLACK);
+  canvas.setTextDatum(top_left);
+  canvas.drawString(title, 2, 1);
+  char index[8]{};
+  snprintf(index, sizeof(index), "%u/%u", static_cast<unsigned>(page) + 1,
+           static_cast<unsigned>(Page::Count));
+  canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  canvas.setTextDatum(top_right);
+  canvas.drawString(index, canvas.width() - 2, 1);
+  canvas.setTextDatum(top_left);
+  canvas.drawFastHLine(0, 10, canvas.width(), color);
+}
+
+void drawCombinedPage(uint32_t nowMs) {
+  ScreenRows rows(canvas, 1, 18);
+  drawGpsStatusRow(rows, nowMs);
+  rows.line(havePeer ? TFT_GREEN : TFT_ORANGE, "%s ch%u",
+            havePeer ? "LINK" : "SCAN",
+            static_cast<unsigned>(havePeer ? peerChannel : scanChannel));
+  rows.line(!latestImu.valid ? TFT_RED
+                             : (calibration.valid ? TFT_GREEN : TFT_ORANGE),
+            "IMU %s",
+            !latestImu.valid ? "WAIT" : (calibration.valid ? "ZERO" : "RAW"));
+  rows.line(TFT_WHITE, "P %+6.1f", latestImu.pitchDeg);
+  rows.line(TFT_WHITE, "R %+6.1f", latestImu.rollDeg);
+  rows.line(TFT_CYAN, "VIB %5.2f", publishedStatistics.vibrationRms);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  char diagnostics[32]{};
+  if (gps.location.isValid()) {
+    snprintf(diagnostics, sizeof(diagnostics), "SEQ %lu AGE %lums",
+             static_cast<unsigned long>(telemetrySequence),
+             static_cast<unsigned long>(
+                 std::min<uint32_t>(gps.location.age(), 99999)));
+  } else {
+    snprintf(diagnostics, sizeof(diagnostics), "SEQ %lu AGE --",
+             static_cast<unsigned long>(telemetrySequence));
+  }
+  canvas.drawString(diagnostics, 2, 110);
+  canvas.drawString(WiFi.macAddress(), 2, 119);
+}
+
+void drawImuPage() {
+  drawTitle(calibration.valid ? "IMU  m/s2  dps" : "IMU RAW m/s2 dps",
+            calibration.valid ? TFT_GREEN : TFT_ORANGE);
+  ScreenRows rows(canvas, 14, 19);
+  if (!latestImu.valid) {
+    rows.line(TFT_RED, "IMU WAIT");
+    return;
+  }
+  rows.line(kAxisXColor, "AX %+6.2f", latestImu.ax);
+  rows.line(kAxisYColor, "AY %+6.2f", latestImu.ay);
+  rows.line(kAxisZColor, "AZ %+6.2f", latestImu.az);
+  rows.line(kAxisXColor, "GX %+6.1f", latestImu.gx);
+  rows.line(kAxisYColor, "GY %+6.1f", latestImu.gy);
+  rows.line(kAxisZColor, "GZ %+6.1f", latestImu.gz);
+}
+
+void drawGpsPage(uint32_t nowMs) {
+  char title[24]{};
+  snprintf(title, sizeof(title), "GPS %lu baud",
+           static_cast<unsigned long>(
+               atom_config::kGpsBaudCandidates[gpsBaudIndex]));
+  drawTitle(title, TFT_CYAN);
+  ScreenRows rows(canvas, 14, 19);
+  drawGpsStatusRow(rows, nowMs);
+  if (gpsPositionFresh()) {
+    rows.line(TFT_WHITE, "%.5f", gps.location.lat());
+    rows.line(TFT_WHITE, "%.5f", gps.location.lng());
+  } else {
+    rows.line(TFT_DARKGREY, "LAT --");
+    rows.line(TFT_DARKGREY, "LON --");
+  }
+  if (gps.speed.isValid() && gps.speed.age() <= atom_config::kGpsFreshMs) {
+    rows.line(TFT_GREEN, "%5.1fkm/h", gps.speed.kmph());
+  } else {
+    rows.line(TFT_DARKGREY, "  --km/h");
+  }
+  if (gps.altitude.isValid() &&
+      gps.altitude.age() <= atom_config::kGpsFreshMs) {
+    rows.line(TFT_WHITE, "ALT %4.0fm", gps.altitude.meters());
+  } else {
+    rows.line(TFT_DARKGREY, "ALT --");
+  }
+  if (gps.hdop.isValid()) {
+    rows.line(gps.hdop.hdop() <= 5.0 ? TFT_WHITE : TFT_ORANGE, "HDOP %.1f",
+              gps.hdop.hdop());
+  } else {
+    rows.line(TFT_DARKGREY, "HDOP --");
+  }
+}
+
+// UTC comes from the GPS when it has fresh time, otherwise from the paired
+// Cardputer's beacon (its GPS, NTP or RTC clock). Local time uses the
+// Cardputer's current UTC offset, which already includes daylight saving.
+void drawTimePage(uint32_t nowMs) {
+  uint64_t utcMs = 0;
+  const char* source = "NO TIME";
+  const bool gpsTime = gps.date.isValid() && gps.time.isValid() &&
+                       gps.time.age() <= atom_config::kGpsFreshMs;
+  if (gpsTime && gpsUtcEpochMs() != 0) {
+    utcMs = gpsUtcEpochMs() + gps.time.age();
+    source = "GPS";
+  } else if (haveHostBeacon && (hostBeacon.time_flags & telemetry::UtcValid) &&
+             nowMs - hostBeaconMs <= kHostClockValidMs) {
+    utcMs = static_cast<uint64_t>(hostBeacon.utc_epoch_s) * 1000ULL +
+            (nowMs - hostBeaconMs);
+    source = "CARDPUTER";
+  }
+  const bool haveOffset =
+      haveHostBeacon && (hostBeacon.time_flags & telemetry::UtcOffsetValid);
+  const int offsetMin = haveOffset ? hostBeacon.utc_offset_min : 0;
+
+  char title[24]{};
+  snprintf(title, sizeof(title), "%s %s", haveOffset ? "LOCAL" : "UTC",
+           source);
+  drawTitle(title, utcMs != 0 ? TFT_GREEN : TFT_ORANGE);
+  canvas.setTextDatum(middle_center);
+  if (utcMs == 0) {
+    canvas.setTextSize(4);
+    canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    canvas.drawString("--:--", 64, 44);
+    canvas.setTextSize(1);
+    canvas.setTextColor(TFT_ORANGE, TFT_BLACK);
+    canvas.drawString("Waiting for GPS time", 64, 80);
+    canvas.drawString("or Cardputer link", 64, 92);
+    canvas.setTextDatum(top_left);
+    return;
+  }
+  const time_t localSeconds = static_cast<time_t>(utcMs / 1000ULL) +
+                              static_cast<time_t>(offsetMin) * 60;
+  struct tm local {};
+  gmtime_r(&localSeconds, &local);
+  char text[24]{};
+  canvas.setTextSize(4);
+  canvas.setTextColor(TFT_GREEN, TFT_BLACK);
+  snprintf(text, sizeof(text), "%02d:%02d", local.tm_hour, local.tm_min);
+  canvas.drawString(text, 64, 36);
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(text, sizeof(text), ":%02d", local.tm_sec);
+  canvas.drawString(text, 64, 66);
+  snprintf(text, sizeof(text), "%04d-%02d-%02d", local.tm_year + 1900,
+           local.tm_mon + 1, local.tm_mday);
+  canvas.drawString(text, 64, 89);
+  static constexpr const char* kDays[] = {"Sun", "Mon", "Tue", "Wed",
+                                          "Thu", "Fri", "Sat"};
+  const int absoluteOffset = offsetMin < 0 ? -offsetMin : offsetMin;
+  if (haveOffset) {
+    snprintf(text, sizeof(text), "%s %c%02d:%02d", kDays[local.tm_wday % 7],
+             offsetMin < 0 ? '-' : '+', absoluteOffset / 60,
+             absoluteOffset % 60);
+  } else {
+    snprintf(text, sizeof(text), "%s UTC", kDays[local.tm_wday % 7]);
+  }
+  canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+  canvas.drawString(text, 64, 112);
+  canvas.setTextDatum(top_left);
+}
+
+// The AtomS3 and Atomic GPS Base have no battery; the Cardputer's battery is
+// relayed in its discovery beacon.
+void drawPowerPage(uint32_t nowMs) {
+  drawTitle("POWER", TFT_CYAN);
+  ScreenRows rows(canvas, 14, 19);
+  rows.line(TFT_WHITE, "ATOMS3");
+  const int32_t ownLevel = M5.Power.getBatteryLevel();
+  if (ownLevel >= 0 && ownLevel <= 100) {
+    rows.line(batteryColor(ownLevel), "BAT %ld%%",
+              static_cast<long>(ownLevel));
+  } else {
+    rows.line(TFT_GREEN, "USB POWER");
+  }
+  rows.line(TFT_WHITE, "CARDPUTER");
+  if (!hostBeaconFresh(nowMs)) {
+    rows.line(TFT_ORANGE, "NO LINK");
+  } else if (hostBeacon.battery_percent < 0) {
+    rows.line(TFT_DARKGREY, "NO GAUGE");
+  } else {
+    rows.line(batteryColor(hostBeacon.battery_percent), "BAT %d%%",
+              hostBeacon.battery_percent);
+    rows.line(TFT_WHITE, "%.2f V", hostBeacon.battery_mv / 1000.0f);
+  }
+}
+
+void drawCalibrationPage() {
+  canvas.setTextSize(2);
+  canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+  canvas.setTextDatum(middle_center);
+  canvas.drawString("ZEROING", 64, 28);
+  canvas.drawString("KEEP", 64, 56);
+  canvas.drawString("STILL", 64, 76);
+  char progress[16]{};
+  snprintf(progress, sizeof(progress), "%lu/200",
+           static_cast<unsigned long>(calibrationSamples));
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.drawString(progress, 64, 106);
+  canvas.setTextDatum(top_left);
+}
+
 void drawStatus(uint32_t nowMs) {
   if (nowMs - lastDisplayMs < atom_config::kDisplayIntervalMs) return;
   lastDisplayMs = nowMs;
-  auto& display = M5.Display;
-  display.fillScreen(TFT_BLACK);
-  display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.setTextSize(2);
-  display.setCursor(3, 3);
-  display.println("GPS+IMU");
-  display.setTextSize(1);
-  display.setTextColor(gps.location.isValid() &&
-                               gps.location.age() <= atom_config::kGpsFreshMs
-                           ? TFT_GREEN
-                           : TFT_ORANGE,
-                       TFT_BLACK);
-  display.printf("GPS %s  SAT %lu\n",
-                 gps.location.isValid() ? "DATA" : "WAIT",
-                 static_cast<unsigned long>(gps.satellites.value()));
-  display.setTextColor(latestImu.valid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  display.printf("IMU %s %s\n", latestImu.valid ? "100Hz" : "WAIT",
-                 calibration.valid ? "ZERO" : "RAW");
-  display.setTextColor(havePeer ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  display.printf("LINK %s CH %u\n", havePeer ? "OK" : "SEARCH", havePeer
-                                                       ? peerChannel
-                                                       : scanChannel);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.printf("SEQ %lu AGE %lums\n", static_cast<unsigned long>(
-                                         telemetrySequence),
-                 static_cast<unsigned long>(gps.location.age()));
-  display.printf("P%+.1f R%+.1f V%.2f\n", latestImu.pitchDeg,
-                 latestImu.rollDeg, publishedStatistics.vibrationRms);
-  display.printf("MAC %s\n", WiFi.macAddress().c_str());
-  display.setTextColor(calibrating ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
-  display.println(calibrating ? "CALIBRATING - KEEP STILL"
-                              : "Hold button: mount zero");
+  if (!canvasReady) return;
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextDatum(top_left);
+  if (calibrating) {
+    drawCalibrationPage();
+  } else {
+    switch (page) {
+      case Page::Imu: drawImuPage(); break;
+      case Page::Gps: drawGpsPage(nowMs); break;
+      case Page::Time: drawTimePage(nowMs); break;
+      case Page::Power: drawPowerPage(nowMs); break;
+      default: drawCombinedPage(nowMs); break;
+    }
+  }
+  canvas.pushSprite(0, 0);
+}
+
+void nextPage() {
+  page = static_cast<Page>((static_cast<uint8_t>(page) + 1U) %
+                           static_cast<uint8_t>(Page::Count));
+  preferences.putUChar("page", static_cast<uint8_t>(page));
+  lastDisplayMs = 0;
 }
 
 }  // namespace
@@ -513,11 +785,20 @@ void setup() {
   M5.begin(m5Config);
   M5.Display.setRotation(0);
   M5.Display.setTextWrap(false);
+  M5.Display.fillScreen(TFT_BLACK);
+  canvas.setColorDepth(16);
+  canvasReady = canvas.createSprite(M5.Display.width(),
+                                    M5.Display.height()) != nullptr;
+  canvas.setTextWrap(false);
   preferences.begin("mountzero", false);
   calibration.valid = preferences.getBool("valid", false);
   calibration.pitchRad = preferences.getFloat("pitch", 0.0f);
   calibration.rollRad = preferences.getFloat("roll", 0.0f);
   calibration.gravityMps2 = preferences.getFloat("gravity", kGravityMps2);
+  const uint8_t savedPage = preferences.getUChar("page", 0);
+  if (savedPage < static_cast<uint8_t>(Page::Count)) {
+    page = static_cast<Page>(savedPage);
+  }
   if (M5.Imu.getType() == m5::imu_none) {
     Serial.println("ERROR: AtomS3 IMU not detected");
   }
@@ -540,7 +821,11 @@ void loop() {
     calibrationButtonLatched = true;
     beginCalibration();
   }
-  if (!M5.BtnA.isPressed()) calibrationButtonLatched = false;
+  // A short press of the screen cycles pages; the hold above zeroes the mount.
+  if (M5.BtnA.wasReleased()) {
+    if (!calibrationButtonLatched) nextPage();
+    calibrationButtonLatched = false;
+  }
   drawStatus(nowMs);
   delay(1);
 }

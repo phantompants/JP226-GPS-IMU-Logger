@@ -62,6 +62,9 @@ uint8_t loadIndex = 0;
 int frontPsi = 30;
 int rearPsi = 30;
 String message;
+// Frames are drawn off-screen and pushed in one transfer to avoid flicker.
+M5Canvas canvas(&M5Dial.Display);
+bool canvasReady = false;
 
 template <size_t N>
 void cycleIndex(uint8_t& index, int delta, const char* const (&values)[N]) {
@@ -368,8 +371,28 @@ void handleControls() {
   }
 }
 
+// M5Unified cannot measure an M5Dial battery, so the Dial shows its own level
+// only if a future board reports one, plus the Cardputer's relayed battery.
+void drawBattery(M5Canvas& display) {
+  const int32_t ownLevel = M5.Power.getBatteryLevel();
+  display.setCursor(25, 81);
+  if (haveStatus && latestStatus.battery_percent >= 0) {
+    const int level = latestStatus.battery_percent;
+    display.setTextColor(level < 20 ? RED : level < 50 ? ORANGE : GREEN,
+                         BLACK);
+    display.printf("CARDPUTER BAT %d%%", level);
+  }
+  if (ownLevel >= 0 && ownLevel <= 100) {
+    display.setCursor(160, 81);
+    display.setTextColor(WHITE, BLACK);
+    display.printf("DIAL %ld%%", static_cast<long>(ownLevel));
+  }
+  display.setTextColor(WHITE, BLACK);
+}
+
 void draw() {
-  auto& display = M5Dial.Display;
+  if (!canvasReady) return;
+  auto& display = canvas;
   display.fillScreen(BLACK);
   display.setTextColor(WHITE, BLACK);
   display.setTextSize(1);
@@ -414,6 +437,7 @@ void draw() {
     display.setTextSize(1);
     display.setCursor(145, 70);
     display.print("km/h");
+    drawBattery(display);
     display.setCursor(25, 97);
     if (haveStatus) {
       display.printf("FIX %s  SAT %u  %s",
@@ -446,6 +470,7 @@ void draw() {
     display.setCursor(50, 214);
     display.print(message.substring(0, 22));
   }
+  display.pushSprite(0, 0);
 }
 
 }  // namespace
@@ -455,6 +480,10 @@ void setup() {
   M5Dial.begin(M5.config(), true, false);
   M5Dial.Display.setRotation(0);
   M5Dial.Display.setBrightness(120);
+  M5Dial.Display.fillScreen(BLACK);
+  canvas.setColorDepth(8);
+  canvasReady = canvas.createSprite(M5Dial.Display.width(),
+                                    M5Dial.Display.height()) != nullptr;
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   nextSequence = esp_random();

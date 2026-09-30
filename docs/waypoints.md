@@ -41,7 +41,8 @@ change, press to send. These values persist on the Cardputer and are
 snapshotted into subsequent waypoint rows. DRIVE shows speed, fix,
 satellites, logging mode, elapsed time since the first valid fix this boot,
 road/tyre/suspension/load values and a short POI. Elapsed time resets after
-a Cardputer reboot. The Dial is an optional remote: Cardputer logging and
+a Cardputer reboot. DRIVE also shows the Cardputer battery; M5Unified
+cannot measure an M5Dial battery. The Dial is an optional remote: Cardputer logging and
 keyboard waypoints work without it.
 
 ESP-NOW v1 packets are unencrypted and unauthenticated. For a known Dial,

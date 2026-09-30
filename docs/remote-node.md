@@ -78,9 +78,28 @@ rates up to 10 Hz without sending one ESP-NOW packet per IMU sample. GPS loss
 does not stop IMU sampling or transmission; validity flags and GPS age identify
 the condition.
 
-The AtomS3 display shows GPS data/waiting state, satellite count, IMU/zero
-state, ESP-NOW link/channel, sequence, GPS age, pitch/roll, vibration and its
-station MAC. `LINK SEARCH` is normal until the Cardputer beacon is found.
+## Display pages and buttons
+
+A short press of the AtomS3 screen cycles five pages; the choice is
+remembered across restarts. Holding the screen for 1.5 seconds zeroes the
+mount from any page. The small side button is the hardware reset: a short
+press restarts the AtomS3 and a 2-second hold enters download mode (green
+LED, screen off).
+
+1. **Combined** - GPS fix/satellites, link state and channel, IMU zero
+   state, pitch, roll and vibration, plus sequence, GPS age and station MAC.
+   `SCAN` is normal until the Cardputer beacon is found.
+2. **IMU** - installed-frame acceleration (m/s^2) and gyro (degrees/second),
+   with X red, Y green and Z blue.
+3. **GPS** - fix/satellites, latitude, longitude, speed, altitude, HDOP and
+   the detected baud rate.
+4. **Time** - large local time and date. UTC comes from the GPS, or from the
+   paired Cardputer's clock when the GPS has no time yet; the local offset
+   (including daylight saving) comes from the Cardputer. Without a
+   Cardputer link the page shows UTC.
+5. **Power** - the AtomS3 and Atomic GPS Base have no battery, so this shows
+   `USB POWER` for the node and the Cardputer's battery percentage and
+   voltage relayed over ESP-NOW.
 
 ## Optional raw IMU capture
 

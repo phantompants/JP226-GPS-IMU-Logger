@@ -195,9 +195,30 @@ void RemoteTelemetryReceiver::sendDiscovery(uint32_t nowMs) {
   telemetry::preparePacket(packet, telemetry::PacketType::Discovery);
   packet.sequence = discoverySequence_++;
   packet.uptime_ms = nowMs;
+  packet.time_flags = beaconTimeFlags_;
+  if (beaconTimeFlags_ & telemetry::UtcValid) {
+    packet.utc_epoch_s =
+        beaconUtcEpochS_ + (nowMs - beaconUtcSetMs_) / 1000U;
+  }
+  packet.utc_offset_min = beaconUtcOffsetMin_;
+  packet.battery_percent = beaconBatteryPercent_;
+  packet.battery_mv = beaconBatteryMv_;
   telemetry::sealPacket(packet);
   esp_now_send(kBroadcastMac, reinterpret_cast<const uint8_t*>(&packet),
                sizeof(packet));
+}
+
+void RemoteTelemetryReceiver::setBeaconInfo(uint32_t utcEpochS,
+                                            int16_t utcOffsetMin,
+                                            uint8_t timeFlags,
+                                            int8_t batteryPercent,
+                                            uint16_t batteryMv) {
+  beaconUtcEpochS_ = utcEpochS;
+  beaconUtcSetMs_ = millis();
+  beaconUtcOffsetMin_ = utcOffsetMin;
+  beaconTimeFlags_ = timeFlags;
+  beaconBatteryPercent_ = batteryPercent;
+  beaconBatteryMv_ = batteryMv;
 }
 
 void RemoteTelemetryReceiver::update(uint32_t nowMs) {
