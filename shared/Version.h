@@ -17,7 +17,7 @@
 
 namespace version {
 
-constexpr char kNumber[] = "v0.12";
+constexpr char kNumber[] = "v0.13";
 constexpr char kGit[] = JP226_GIT_HASH;
 constexpr char kDate[] = JP226_BUILD_DATE;
 

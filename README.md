@@ -398,33 +398,6 @@ Rows from before the logger knows the time go to `no-clock.csv`.
 platformio run -d atom_blackbox -t upload --upload-port COMx
 ```
 
-## ESPHome car display
-
-`esphome/jp226-car-display.yaml` turns an ESP8266 desk display with a 240x240
-ST7789 screen (the GeekMagic SmallTV style "smart weather clock") into a
-dashboard for the Cardputer. It stays an ESPHome device, so you flash and
-update it from Home Assistant's ESPHome add-on over Wi-Fi as usual.
-
-In the car it joins the Starlink or iPhone hotspot Wi-Fi. Whenever the
-Cardputer (or Core2) is on Wi-Fi it broadcasts a status line every two seconds
-on UDP port 47226, so the display needs no IP address set. Pages cycle by
-themselves:
-
-| Page | Shows |
-|---|---|
-| DRIVE | GPS speed, elevation, compass heading, fix and satellites |
-| TILT | Pitch and roll with a tilt line: green under 15°, orange to 25°, red beyond |
-| TRIP | Distance, driving time, total climb, elevation and logging state |
-| STATUS | Logger, source, IMU, SD card, battery, black box, last waypoint and place |
-| CHARITY | The running dinosaur, "The Fast and the Fossilized", raising funds for Variety |
-
-Choose which logger it follows (Auto, Cardputer, Cardputer ADV or Core2) on
-the display's own web page. Add your home, Starlink and hotspot Wi-Fi details
-to the ESPHome `secrets.yaml` (the names are listed at the top of the YAML).
-Some phone hotspots and routers block devices from seeing each other's
-broadcasts; if the display stays on WAITING with both on the same Wi-Fi, check
-for a "client isolation" or "AP isolation" setting.
-
 ## Controls
 
 | Key | Action |
@@ -814,7 +787,6 @@ atoms3_gps_imu/           independent AtomS3 + Atomic GPS Base firmware
 m5dial_waypoint/           independent M5Dial control firmware
 atom_echo/                Atom Echo spoken alerts and waypoint button
 atom_blackbox/            Atom Lite + SPK base backup "black box" logger
-esphome/                  ESPHome car display (ESP8266 + 240x240 screen)
 docs/                     remote setup and telemetry protocol reference
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests

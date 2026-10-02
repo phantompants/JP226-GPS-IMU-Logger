@@ -9,7 +9,6 @@
 #include <SPI.h>
 #include <TinyGPSPlus.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
@@ -381,9 +380,6 @@ uint32_t lastClockSyncMs = 0;
 uint32_t lastRtcWriteMs = 0;
 uint64_t rowsWritten = 0;
 uint32_t tripStartedMs = 0;
-// Distance driven and height climbed since power-on, for the car display.
-double tripKm = 0.0;
-double tripClimbM = 0.0;
 uint8_t displayBrightness = 128;
 size_t groveBaudIndex = 0;
 uint32_t groveBaudStartedMs = 0;
@@ -1360,118 +1356,6 @@ void handleDialCommand(const telemetry::DialCommandPacket& command) {
   waypointId.toCharArray(ack.waypoint_id, sizeof(ack.waypoint_id));
   telemetry::sealPacket(ack);
   remoteReceiver.sendDialAck(ack);
-}
-
-// Adds the distance between fresh fixes once a second. Readings below
-// walking pace are skipped, so GPS wander while parked does not count.
-void updateTripOdometer(const GpsSnapshot& gps, uint32_t nowMs) {
-  static uint32_t lastMs = 0;
-  static double lastLatitude = 0.0;
-  static double lastLongitude = 0.0;
-  static bool haveLast = false;
-  if (nowMs - lastMs < 1000) return;
-  lastMs = nowMs;
-  if (!gps.fixValid || !gps.positionFresh) {
-    haveLast = false;
-    return;
-  }
-  if (haveLast && gps.speedFresh && gps.speedKmh > 3.0) {
-    const double metres = TinyGPSPlus::distanceBetween(
-        lastLatitude, lastLongitude, gps.latitude, gps.longitude);
-    // Ignore jumps no vehicle could make in a second (bad fixes).
-    if (metres < 100.0) tripKm += metres / 1000.0;
-  }
-  // GPS altitude wanders by a few metres, so climb only counts once the
-  // height has risen 5 m above the last low point.
-  static double climbBase = 0.0;
-  static bool haveClimbBase = false;
-  if (gps.altitudeFresh) {
-    if (!haveClimbBase || gps.altitudeM < climbBase) {
-      climbBase = gps.altitudeM;
-      haveClimbBase = true;
-    } else if (gps.altitudeM - climbBase >= 5.0) {
-      tripClimbM += gps.altitudeM - climbBase;
-      climbBase = gps.altitudeM;
-    }
-  }
-  lastLatitude = gps.latitude;
-  lastLongitude = gps.longitude;
-  haveLast = true;
-}
-
-// One line of '|'-separated fields broadcast on the local Wi-Fi every two
-// seconds for the ESPHome car display. Field order (version JP226S1):
-// board, speed km/h, fix, satellites, log mode, source, IMU ok, SD ok,
-// battery %, trip seconds, trip km, local time, place, last waypoint,
-// black box (0 none, 1 recording, 2 linked, 3 lost), black box rows, version,
-// altitude m ("" when unknown), heading, pitch, roll ("" without an IMU),
-// trip climb m.
-void broadcastStatus(uint32_t nowMs) {
-  static WiFiUDP udp;
-  static uint32_t lastMs = 0;
-  if (WiFi.status() != WL_CONNECTED ||
-      nowMs - lastMs < config::kStatusBroadcastIntervalMs) {
-    return;
-  }
-  lastMs = nowMs;
-  const GpsSnapshot& gps = activeTelemetry.gps;
-  auto clean = [](String value) {
-    value.replace('|', '/');
-    return value;
-  };
-  char localTime[8] = "--:--";
-  if (clockIsReady()) {
-    const time_t now = time(nullptr);
-    struct tm local {};
-    localtime_r(&now, &local);
-    snprintf(localTime, sizeof(localTime), "%02d:%02d", local.tm_hour,
-             local.tm_min);
-  }
-  String poi;
-  String poiSource;
-  String waypointId;
-  currentPoi(gps, poi, poiSource, waypointId);
-  telemetry::BlackBoxStatusPacket box{};
-  uint32_t boxAgeMs = 0;
-  int boxState = 0;
-  if (remoteReceiver.blackBoxStatus(box, boxAgeMs, nowMs)) {
-    boxState = boxAgeMs >= 6000 ? 3
-               : (box.flags & telemetry::BlackBoxRecording) ? 1
-                                                             : 2;
-  }
-  const String lastWaypoint =
-      waypointStore.hasLast() ? waypointStore.last().id : String("");
-  // Unknown values are sent as empty fields so the display can show dashes.
-  const ImuSample& imuSample = activeTelemetry.imu;
-  char altitude[12] = "";
-  char heading[12] = "";
-  char pitch[12] = "";
-  char roll[12] = "";
-  if (gps.altitudeFresh) snprintf(altitude, sizeof(altitude), "%.0f", gps.altitudeM);
-  if (gps.courseFresh) snprintf(heading, sizeof(heading), "%.0f", gps.courseDeg);
-  if (imuSample.valid) {
-    snprintf(pitch, sizeof(pitch), "%.1f", imuSample.pitchDeg);
-    snprintf(roll, sizeof(roll), "%.1f", imuSample.rollDeg);
-  }
-  char line[320];
-  snprintf(line, sizeof(line),
-           "JP226S1|%u|%.0f|%u|%lu|%s|%s|%u|%u|%d|%lu|%.1f|%s|%s|%s|%d|%lu|%s|"
-           "%s|%s|%s|%s|%.0f",
-           static_cast<unsigned>(loggerBoard()),
-           gps.speedFresh ? gps.speedKmh : 0.0, gps.fixValid ? 1U : 0U,
-           static_cast<unsigned long>(gps.satellites), modeName(mode),
-           telemetrySourceLabel(telemetrySource),
-           activeTelemetry.imu.available ? 1U : 0U, sdMounted ? 1U : 0U,
-           batteryPercent,
-           static_cast<unsigned long>(
-               tripStartedMs == 0 ? 0 : (nowMs - tripStartedMs) / 1000),
-           tripKm, localTime, clean(poi).c_str(), clean(lastWaypoint).c_str(),
-           boxState, static_cast<unsigned long>(box.rows_written),
-           version::kNumber, altitude, heading, pitch, roll, tripClimbM);
-  if (udp.beginPacket(WiFi.broadcastIP(), config::kStatusBroadcastPort)) {
-    udp.write(reinterpret_cast<const uint8_t*>(line), strlen(line));
-    udp.endPacket();
-  }
 }
 
 // What this logger is recording, for an Atom Lite black box to keep a backup
@@ -2769,8 +2653,6 @@ void loop() {
   updateBeaconInfo(nowMs);
   sendDialStatus(nowMs);
   sendPositionReport(nowMs);
-  updateTripOdometer(gpsSample, nowMs);
-  broadcastStatus(nowMs);
 
   markLoopStep(StepStatus);
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&

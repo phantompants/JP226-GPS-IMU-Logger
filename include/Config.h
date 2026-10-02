@@ -119,10 +119,6 @@ constexpr char kKmlDirectory[] = "/telemetry/kml";
 constexpr uint16_t kKmlLinesPerUpdate = 12;
 constexpr uint16_t kKmlFlushEveryPoints = 128;
 constexpr char kWebHostname[] = "jp226-logger";
-// UDP port for the status broadcast read by the ESPHome car display
-// (esphome/jp226-car-display.yaml). Sent every two seconds on Wi-Fi.
-constexpr uint16_t kStatusBroadcastPort = 47226;
-constexpr uint32_t kStatusBroadcastIntervalMs = 2000;
 
 }  // namespace config
 

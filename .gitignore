@@ -9,5 +9,3 @@ logger.cfg
 # Intermediate WAVs from atom_echo/tools/make_clips.ps1 (packed into src/Clips.h)
 atom_echo/clips/
 
-# Personal ESPHome copy for Home Assistant (keeps the device's own name and secrets)
-esphome/mac-mini-4.yaml
