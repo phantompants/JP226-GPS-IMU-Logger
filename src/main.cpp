@@ -72,6 +72,7 @@ enum class DashboardPage : uint8_t {
   ImuSource,
   Wifi,
   Logger,
+  BlackBox,
   TimeNetwork,
   KmlExport,
   Waypoint,
@@ -1357,6 +1358,52 @@ void handleDialCommand(const telemetry::DialCommandPacket& command) {
   remoteReceiver.sendDialAck(ack);
 }
 
+// What this logger is recording, for an Atom Lite black box to keep a backup
+// copy. Sent once a second to every paired controller.
+void sendPositionReport(uint32_t nowMs) {
+  if (!remoteReceiver.dialConnected(nowMs)) return;
+  static uint32_t sequence = 0;
+  const GpsSnapshot& gps = activeTelemetry.gps;
+  const ImuSample& imuSample = activeTelemetry.imu;
+  telemetry::PositionReportPacket report{};
+  telemetry::preparePacket(report, telemetry::PacketType::PositionReport);
+  report.sequence = sequence++;
+  if (gps.utcValid) {
+    report.utc_ms = gps.utcEpochMs;
+    report.flags |= telemetry::PositionUtcValid;
+  } else if (clockIsReady()) {
+    report.utc_ms = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
+    report.flags |= telemetry::PositionUtcValid;
+  }
+  int16_t offset = 0;
+  if (clockIsReady() && localUtcOffsetMinutes(time(nullptr), offset)) {
+    report.utc_offset_min = offset;
+  }
+  if (gps.fixValid) report.flags |= telemetry::PositionFix;
+  if (gps.positionFresh) report.flags |= telemetry::PositionValid;
+  if (imuSample.valid) report.flags |= telemetry::PositionImuValid;
+  report.satellites = std::min(gps.satellites, static_cast<uint32_t>(255));
+  report.logger_board = static_cast<uint8_t>(loggerBoard());
+  report.log_mode = static_cast<uint8_t>(mode);
+  report.latitude_deg = gps.latitude;
+  report.longitude_deg = gps.longitude;
+  report.altitude_m = gps.altitudeM;
+  report.speed_kmh = gps.speedFresh ? gps.speedKmh : 0.0f;
+  report.course_deg = gps.courseDeg;
+  report.hdop = gps.hdop;
+  report.accel_x_mps2 = imuSample.axMps2;
+  report.accel_y_mps2 = imuSample.ayMps2;
+  report.accel_z_mps2 = imuSample.azMps2;
+  report.gyro_x_dps = imuSample.gxDps;
+  report.gyro_y_dps = imuSample.gyDps;
+  report.gyro_z_dps = imuSample.gzDps;
+  report.pitch_deg = imuSample.pitchDeg;
+  report.roll_deg = imuSample.rollDeg;
+  report.vibration_rms_mps2 = imuSample.vibrationRmsMps2;
+  telemetry::sealPacket(report);
+  remoteReceiver.sendPositionReport(report, nowMs);
+}
+
 void sendDialStatus(uint32_t nowMs) {
   if (!remoteReceiver.dialConnected(nowMs)) return;
   static uint32_t lastPreparedMs = 0;
@@ -2015,6 +2062,48 @@ void drawLoggerPage(time_t nowUtc) {
   drawPageFooter();
 }
 
+void drawBlackBoxPage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("BLACK BOX");
+  display.setTextSize(2);
+  display.setCursor(3, 27);
+  telemetry::BlackBoxStatusPacket box{};
+  uint32_t ageMs = 0;
+  if (!remoteReceiver.blackBoxStatus(box, ageMs, nowMs)) {
+    display.setTextColor(kStatusBad, TFT_BLACK);
+    display.println("NOT SEEN");
+    display.setTextSize(1);
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.println();
+    display.println("Power the Atom Lite black box and set");
+    display.println("it to this Cardputer: hold its button");
+    display.println("and press reset (magenta = v1,");
+    display.println("cyan = ADV).");
+    drawPageFooter();
+    return;
+  }
+  const bool linked = ageMs < 6000;
+  const bool sdOk = box.flags & telemetry::BlackBoxSdReady;
+  const bool recording = linked && (box.flags & telemetry::BlackBoxRecording);
+  if (!linked) {
+    display.setTextColor(kStatusBad, TFT_BLACK);
+    display.printf("LINK LOST %lus\n", static_cast<unsigned long>(ageMs / 1000));
+  } else {
+    display.setTextColor(recording ? kStatusGood : kStatusWait, TFT_BLACK);
+    display.println(recording ? "RECORDING" : "NOT RECORDING");
+  }
+  printStatus(display, "SD: ", sdOk ? kStatusGood : kStatusBad,
+              sdOk ? "OK" : "ERROR");
+  display.printf("  %lu MB\n", static_cast<unsigned long>(box.sd_free_mb));
+  display.printf("Rows: %lu\n", static_cast<unsigned long>(box.rows_written));
+  display.setTextSize(1);
+  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  char file[sizeof(box.file) + 1]{};
+  std::memcpy(file, box.file, sizeof(box.file));
+  display.println(file[0] ? file : "(no file yet)");
+  drawPageFooter();
+}
+
 void drawTimeNetworkPage(time_t nowUtc) {
   auto& display = dashboardCanvas;
   drawPageTitle("TIME / NETWORK");
@@ -2286,6 +2375,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
       break;
     case DashboardPage::Logger:
       drawLoggerPage(nowUtc);
+      break;
+    case DashboardPage::BlackBox:
+      drawBlackBoxPage(nowMs);
       break;
     case DashboardPage::TimeNetwork:
       drawTimeNetworkPage(nowUtc);
@@ -2560,6 +2652,7 @@ void loop() {
   printHardwareReport(nowMs);
   updateBeaconInfo(nowMs);
   sendDialStatus(nowMs);
+  sendPositionReport(nowMs);
 
   markLoopStep(StepStatus);
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&

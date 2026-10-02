@@ -19,6 +19,12 @@ class RemoteTelemetryReceiver {
                       uint32_t nowMs);
   void sendDialAck(const telemetry::DialAckPacket& packet);
   bool dialConnected(uint32_t nowMs) const;
+  // Once a second to every controller, for the black box's backup log.
+  void sendPositionReport(const telemetry::PositionReportPacket& packet,
+                          uint32_t nowMs);
+  // Latest report from a black box; false if none has been heard.
+  bool blackBoxStatus(telemetry::BlackBoxStatusPacket& packet,
+                      uint32_t& ageMs, uint32_t nowMs) const;
   uint8_t controllerCount(uint32_t nowMs) const;
   // Clock, UTC offset, battery and board type copied into each beacon.
   void setBeaconInfo(uint32_t utcEpochS, int16_t utcOffsetMin,
@@ -39,7 +45,8 @@ class RemoteTelemetryReceiver {
   void sendDiscovery(uint32_t nowMs);
   bool controllerFresh(size_t slot, uint32_t nowMs) const;
 
-  static constexpr size_t kMaxControllers = 2;
+  // M5Dial, Atom Echo and black box together, with one spare.
+  static constexpr size_t kMaxControllers = 4;
   static constexpr uint32_t kControllerStaleMs = 5'000;
 
   struct Controller {
@@ -77,6 +84,10 @@ class RemoteTelemetryReceiver {
   uint32_t lastPacketMs_ = 0;
   uint32_t lastDiscoveryMs_ = 0;
   uint32_t lastDialStatusMs_ = 0;
+  uint32_t lastPositionReportMs_ = 0;
+  telemetry::BlackBoxStatusPacket blackBox_{};
+  bool haveBlackBox_ = false;
+  uint32_t lastBlackBoxMs_ = 0;
   uint32_t discoverySequence_ = 0;
   uint32_t beaconUtcEpochS_ = 0;
   uint32_t beaconUtcSetMs_ = 0;

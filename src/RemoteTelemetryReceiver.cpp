@@ -135,6 +135,21 @@ void RemoteTelemetryReceiver::receive(const esp_now_recv_info_t* info,
     portEXIT_CRITICAL(&mux_);
     return;
   }
+  if (type == telemetry::PacketType::BlackBoxStatus &&
+      length == static_cast<int>(sizeof(telemetry::BlackBoxStatusPacket))) {
+    telemetry::BlackBoxStatusPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (!telemetry::validatePacket(packet,
+                                   telemetry::PacketType::BlackBoxStatus)) {
+      return;
+    }
+    portENTER_CRITICAL(&mux_);
+    blackBox_ = packet;
+    haveBlackBox_ = true;
+    lastBlackBoxMs_ = millis();
+    portEXIT_CRITICAL(&mux_);
+    return;
+  }
   if (!sourceAllowed(info->src_addr)) return;
   if (type == telemetry::PacketType::Telemetry &&
       length == static_cast<int>(sizeof(telemetry::TelemetryPacket))) {
@@ -357,6 +372,34 @@ void RemoteTelemetryReceiver::sendDialStatus(
                    sizeof(packet));
     }
   }
+}
+
+void RemoteTelemetryReceiver::sendPositionReport(
+    const telemetry::PositionReportPacket& packet, uint32_t nowMs) {
+  if (!ready_ || nowMs - lastPositionReportMs_ < 1000) return;
+  lastPositionReportMs_ = nowMs;
+  for (size_t i = 0; i < kMaxControllers; ++i) {
+    uint8_t mac[6]{};
+    portENTER_CRITICAL(&mux_);
+    const bool send = controllerFresh(i, nowMs) && controllers_[i].peerAdded;
+    std::memcpy(mac, controllers_[i].addedMac, 6);
+    portEXIT_CRITICAL(&mux_);
+    if (send) {
+      esp_now_send(mac, reinterpret_cast<const uint8_t*>(&packet),
+                   sizeof(packet));
+    }
+  }
+}
+
+bool RemoteTelemetryReceiver::blackBoxStatus(
+    telemetry::BlackBoxStatusPacket& packet, uint32_t& ageMs,
+    uint32_t nowMs) const {
+  portENTER_CRITICAL(&mux_);
+  const bool have = haveBlackBox_;
+  packet = blackBox_;
+  ageMs = telemetry::elapsedMs(nowMs, lastBlackBoxMs_);
+  portEXIT_CRITICAL(&mux_);
+  return have;
 }
 
 void RemoteTelemetryReceiver::sendDialAck(

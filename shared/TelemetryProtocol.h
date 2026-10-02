@@ -17,6 +17,8 @@ enum class PacketType : std::uint8_t {
   DialCommand = 4,
   DialStatus = 5,
   DialAck = 6,
+  PositionReport = 7,   // Logger -> controllers, once a second.
+  BlackBoxStatus = 8,   // Black box -> logger.
 };
 
 enum class DialAction : std::uint8_t {
@@ -76,6 +78,20 @@ inline bool boardMatches(LoggerBoard wanted, LoggerBoard board) {
   return wanted == LoggerBoard::Unknown || board == LoggerBoard::Unknown ||
          wanted == board;
 }
+
+// PositionReportPacket::flags
+enum PositionFlag : std::uint8_t {
+  PositionFix = 1U << 0,
+  PositionValid = 1U << 1,
+  PositionUtcValid = 1U << 2,
+  PositionImuValid = 1U << 3,
+};
+
+// BlackBoxStatusPacket::flags
+enum BlackBoxFlag : std::uint8_t {
+  BlackBoxSdReady = 1U << 0,
+  BlackBoxRecording = 1U << 1,  // A position arrived recently and was saved.
+};
 
 // DialStatusPacket::link_flags
 enum LinkFlag : std::uint8_t {
@@ -187,6 +203,48 @@ struct DialAckPacket {
   std::uint32_t crc32;
 };
 
+// What the logger is recording, for the black box's backup log. Sent to every
+// paired controller; the M5Dial and Atom Echo ignore it.
+struct PositionReportPacket {
+  PacketHeader header;
+  std::uint32_t sequence;
+  std::uint64_t utc_ms;
+  std::uint8_t flags;  // PositionFlag bits
+  std::uint8_t satellites;
+  std::uint8_t logger_board;  // LoggerBoard
+  std::uint8_t log_mode;
+  std::int16_t utc_offset_min;
+  std::uint8_t reserved0[2];
+  double latitude_deg;
+  double longitude_deg;
+  float altitude_m;
+  float speed_kmh;
+  float course_deg;
+  float hdop;
+  float accel_x_mps2;
+  float accel_y_mps2;
+  float accel_z_mps2;
+  float gyro_x_dps;
+  float gyro_y_dps;
+  float gyro_z_dps;
+  float pitch_deg;
+  float roll_deg;
+  float vibration_rms_mps2;
+  std::uint32_t crc32;
+};
+
+struct BlackBoxStatusPacket {
+  PacketHeader header;
+  std::uint32_t sequence;
+  std::uint32_t uptime_ms;
+  std::uint32_t rows_written;
+  std::uint32_t sd_free_mb;
+  std::uint8_t flags;  // BlackBoxFlag bits
+  std::uint8_t reserved0[3];
+  char file[24];
+  std::uint32_t crc32;
+};
+
 // Optional raw stream. Acceleration is milli-g, gyro is 0.1 degree/second,
 // and time_offset_100us is in 100-microsecond ticks from batch_start_time_ms.
 struct RawImuSample {
@@ -221,6 +279,9 @@ static_assert(sizeof(DialCommandPacket) <= kEspNowV1PayloadLimit &&
                   sizeof(DialStatusPacket) <= kEspNowV1PayloadLimit &&
                   sizeof(DialAckPacket) <= kEspNowV1PayloadLimit,
               "Dial packets must fit an ESP-NOW v1 payload");
+static_assert(sizeof(PositionReportPacket) <= kEspNowV1PayloadLimit &&
+                  sizeof(BlackBoxStatusPacket) <= kEspNowV1PayloadLimit,
+              "Black box packets must fit an ESP-NOW v1 payload");
 static_assert(sizeof(float) == 4 && sizeof(double) == 8,
               "Protocol requires IEEE-754 32/64-bit floating point");
 

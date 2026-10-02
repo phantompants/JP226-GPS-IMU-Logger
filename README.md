@@ -371,6 +371,33 @@ The clips are generated with Windows text-to-speech. To change the wording,
 edit the phrases in `atom_echo/tools/make_clips.ps1` and run it from the
 `atom_echo` folder; it rewrites `src/Clips.h`.
 
+## Atom Lite black box
+
+`atom_blackbox/` turns an M5Stack Atom Lite on an Atomic SPK base into a
+backup logger for a Cardputer (v1 or ADV). The Cardputer sends it a position
+report once a second, and it writes them to daily CSV files in `/blackbox/` on
+the base's microSD card: time, position, speed, heading, satellites, fix and
+the IMU readings. If the Cardputer's own card fails or fills up, the trip is
+still on the black box. Unlike the Atom Echo, the Atom Lite has nothing on the
+base's SD pins, so the card is safe to use here.
+
+- **Choose its logger:** hold the button and press the small reset button on
+  the side. It toggles between the Cardputer v1 (blinks magenta) and the
+  Cardputer ADV (blinks cyan); a normal start blinks the current choice once.
+- **Button:** tap to save a `BLACKBOX` waypoint on the Cardputer (green flash
+  when saved, red if not).
+- **Light:** blue blink while searching, green while recording, amber when
+  linked but not recording, red blink for an SD card problem.
+- **On the Cardputer:** the BLACK BOX page shows whether it is linked and
+  recording, its SD card status and free space, rows written and today's file.
+
+Rows are written in batches of ten (or every ten seconds) to spare the card.
+Rows from before the logger knows the time go to `no-clock.csv`.
+
+```powershell
+platformio run -d atom_blackbox -t upload --upload-port COMx
+```
+
 ## Controls
 
 | Key | Action |
@@ -759,6 +786,7 @@ shared/TelemetryProtocol.h  versioned 136-byte packet, CRC and raw batch format
 atoms3_gps_imu/           independent AtomS3 + Atomic GPS Base firmware
 m5dial_waypoint/           independent M5Dial control firmware
 atom_echo/                Atom Echo spoken alerts and waypoint button
+atom_blackbox/            Atom Lite + SPK base backup "black box" logger
 docs/                     remote setup and telemetry protocol reference
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests
