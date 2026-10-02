@@ -20,6 +20,7 @@
 
 #include "Config.h"
 #include "DinoSprite.h"
+#include "Version.h"
 #include "KmlExporter.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
@@ -74,6 +75,7 @@ enum class DashboardPage : uint8_t {
   TimeNetwork,
   KmlExport,
   Waypoint,
+  Version,
   About,
   Count,
 };
@@ -1457,7 +1459,7 @@ float dinoGameSpeedKmh() {
 }
 
 void saveDinoBest() {
-  if (dinoGame.takeNewBest()) preferences.putUShort("dino_best", dinoGame.best());
+  if (dinoGame.takeNewBest()) preferences.putUShort(dino::kBestKey, dinoGame.best());
 }
 
 uint16_t logModeColor(LogMode value) {
@@ -2167,6 +2169,27 @@ void drawWaypointPage(const GpsSnapshot& gps, uint32_t nowMs) {
   drawPageFooter("P:waypoint  [ ]:pages");
 }
 
+// Version details, dinosaur style: the build's species (version), DNA (git
+// commit) and hatching date, plus a rotating one-liner.
+void drawVersionPage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("FOSSIL RECORD");
+  dino::draw(display, display.width() - dino::kWidth * 2 - 4, 24, 2,
+             (nowMs / 4000) % dino::kFrameCount);
+  display.setTextSize(2);
+  display.setCursor(3, 27);
+  printStatus(display, "Species ", TFT_CYAN, version::kNumber);
+  display.setCursor(3, 45);
+  printStatus(display, "DNA ", TFT_YELLOW, version::kGit);
+  display.setCursor(3, 63);
+  printStatus(display, "Hatched ", TFT_GREEN, version::kDate);
+  display.setTextDatum(middle_center);
+  display.setTextColor(TFT_ORANGE, TFT_BLACK);
+  display.drawString(version::jokeAt(nowMs), display.width() / 2, 100);
+  display.setTextDatum(top_left);
+  drawPageFooter();
+}
+
 void drawAboutPage(uint32_t nowMs) {
   auto& display = dashboardCanvas;
   drawPageTitle("JP226PRINTS");
@@ -2185,17 +2208,17 @@ void drawAboutPage(uint32_t nowMs) {
       display.drawString("SPACE: PLAY", width - 3, 14);
       break;
     case dino::Game::State::Playing:
-      display.setTextColor(TFT_WHITE, TFT_BLACK);
-      display.drawString(String("SCORE ") + dinoGame.score() + "  BEST " +
-                             dinoGame.best(),
-                         width - 3, 14);
+    case dino::Game::State::Over: {
+      char text[32];
+      dinoGame.statusText(text, sizeof(text));
+      display.setTextColor(dinoGame.state() == dino::Game::State::Playing
+                               ? TFT_WHITE
+                           : dinoGame.beatBest() ? TFT_GREEN
+                                                 : TFT_RED,
+                           TFT_BLACK);
+      display.drawString(text, width - 3, 14);
       break;
-    case dino::Game::State::Over:
-      display.setTextColor(TFT_RED, TFT_BLACK);
-      display.drawString(String("GAME OVER ") + dinoGame.score() + "  BEST " +
-                             dinoGame.best(),
-                         width - 3, 14);
-      break;
+    }
     default:
       break;
   }
@@ -2272,6 +2295,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
       break;
     case DashboardPage::Waypoint:
       drawWaypointPage(sample, nowMs);
+      break;
+    case DashboardPage::Version:
+      drawVersionPage(nowMs);
       break;
     case DashboardPage::About:
       drawAboutPage(nowMs);
@@ -2359,7 +2385,7 @@ void printHardwareReport(uint32_t nowMs) {
 
 void loadPersistentState() {
   preferences.begin("gpsimu", false);
-  dinoGame.setBest(preferences.getUShort("dino_best", 0));
+  dinoGame.setBest(preferences.getUShort(dino::kBestKey, 0));
   const uint8_t savedPage = preferences.getUChar("page", 0);
 #if JP226_CORE2
   restoreCore2Page(savedPage);

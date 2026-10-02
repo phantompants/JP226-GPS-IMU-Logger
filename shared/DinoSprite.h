@@ -4,7 +4,9 @@
 // page on every device with a screen. Two running frames, 24x16 pixels:
 // G body, D back plates, W eye, K pupil, '.' transparent.
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace dino {
 
@@ -86,6 +88,9 @@ inline int runX(uint32_t nowMs, int areaWidth, int scale) {
 
 constexpr const char kCredit1[] = "Brought to you by";
 constexpr const char kCredit2[] = "JP226Prints";
+// Preferences key for the personal best, in seconds. (Older firmware kept an
+// obstacle count under "dino_best"; a new key keeps those out of the PBs.)
+constexpr const char kBestKey[] = "dino_pb";
 
 // "Dino Dash": while the vehicle is moving the dinosaur just runs across the
 // screen; once parked it becomes a game. Rocks and cacti scroll in from the
@@ -119,32 +124,37 @@ class Game {
     }
     if (state_ != State::Playing) return;
 
-    vy_ -= kGravity * dt;
-    y_ += vy_ * dt;
-    if (y_ <= 0.0f) {
-      y_ = 0.0f;
-      vy_ = 0.0f;
-    }
-    const float speed = score_ * 1.5f + 40.0f < 110.0f ? score_ * 1.5f + 40.0f
-                                                       : 110.0f;
+    // Starts gently and speeds up slowly.
+    // The score is whole seconds survived. Starts gently and speeds up as
+    // the run goes on.
+    score_ = static_cast<uint16_t>((nowMs - startMs_) / 1000);
+    const float speed = score_ * 0.7f + 32.0f < 90.0f ? score_ * 0.7f + 32.0f
+                                                      : 90.0f;
+    const float previousY = y_;
+    // Rocks and cacti are platforms: the dinosaur can land on top and ride
+    // along, and only crashes into the side of one. The floor is the highest
+    // top it is standing over.
+    float floor = 0.0f;
     for (Obstacle& obstacle : obstacles_) {
       obstacle.x -= speed * dt;
       if (obstacle.x + obstacle.width < 0.0f) respawn(obstacle);
-      if (!obstacle.passed && obstacle.x + obstacle.width < kDinoX + 4) {
-        obstacle.passed = true;
-        ++score_;
+      // Only the legs collide, with a forgiving unit trimmed off each side.
+      const bool overlap = obstacle.x < kDinoX + 18 &&
+                           obstacle.x + obstacle.width > kDinoX + 6;
+      if (!overlap) continue;
+      if (previousY >= obstacle.height - 1.0f) {
+        if (obstacle.height > floor) floor = obstacle.height;
+      } else {
+        crash(nowMs);
+        return;
       }
-      // The body overhangs the legs, so only the leg span collides.
-      const bool overlap = obstacle.x < kDinoX + 20 &&
-                           obstacle.x + obstacle.width > kDinoX + 4;
-      if (overlap && y_ < obstacle.height) {
-        state_ = State::Over;
-        overMs_ = nowMs;
-        if (score_ > best_) {
-          best_ = score_;
-          newBest_ = true;
-        }
-      }
+    }
+    vy_ -= kGravity * dt;
+    y_ += vy_ * dt;
+    onGround_ = y_ <= floor;
+    if (onGround_) {
+      y_ = floor;
+      vy_ = 0.0f;
     }
   }
 
@@ -157,7 +167,10 @@ class Game {
         vy_ = kJumpSpeed;
         break;
       case State::Playing:
-        if (y_ == 0.0f) vy_ = kJumpSpeed;
+        if (onGround_) {
+          vy_ = kJumpSpeed;
+          onGround_ = false;
+        }
         break;
       case State::Over:
         // A short pause so a late jump does not restart straight away.
@@ -173,6 +186,21 @@ class Game {
 
   State state() const { return state_; }
   uint16_t score() const { return score_; }
+  // True on the game-over screen when that run set a new personal best.
+  bool beatBest() const { return beatBest_; }
+
+  // "12s  PB 34s" while playing, "GAME OVER 12s  PB 34s" or "NEW PB 41s!"
+  // afterwards; empty otherwise. Screens add their own "press to play".
+  void statusText(char* text, size_t size) const {
+    text[0] = '\0';
+    if (state_ == State::Playing) {
+      snprintf(text, size, "%us  PB %us", score_, best_);
+    } else if (state_ == State::Over && beatBest_) {
+      snprintf(text, size, "NEW PB %us!", score_);
+    } else if (state_ == State::Over) {
+      snprintf(text, size, "GAME OVER %us  PB %us", score_, best_);
+    }
+  }
   uint16_t best() const { return best_; }
   void setBest(uint16_t best) { best_ = best; }
   // True once after a game sets a new best, so the caller can save it.
@@ -202,7 +230,7 @@ class Game {
       if (x >= left + widthPx || x + obstacle.width * scale <= left) continue;
       drawObstacle(gfx, obstacle, x, groundY, scale);
     }
-    const bool running = state_ == State::Playing && y_ == 0.0f;
+    const bool running = state_ == State::Playing && onGround_;
     dino::draw(gfx, left + static_cast<int>(kDinoX * scale),
                top - static_cast<int>(y_ * scale), scale,
                running ? frameAt(nowMs) : 0);
@@ -214,7 +242,6 @@ class Game {
     uint8_t width = 0;
     uint8_t height = 0;
     bool cactus = false;
-    bool passed = false;
   };
 
   static constexpr int kDinoX = 4;
@@ -240,15 +267,27 @@ class Game {
     obstacle.width = obstacle.cactus ? 6 : 7;
     obstacle.height = obstacle.cactus ? 9 : 4 + nextRandom() % 3;
     // Gaps long enough to land and jump again at the fastest speed.
-    obstacle.x = rightmost + 45 + nextRandom() % 50;
-    obstacle.passed = false;
+    obstacle.x = rightmost + 50 + nextRandom() % 50;
+  }
+
+  void crash(uint32_t nowMs) {
+    state_ = State::Over;
+    overMs_ = nowMs;
+    beatBest_ = score_ > best_;
+    if (beatBest_) {
+      best_ = score_;
+      newBest_ = true;
+    }
   }
 
   void reset() {
     seed_ ^= lastMs_ | 1U;
     y_ = 0.0f;
     vy_ = 0.0f;
+    onGround_ = true;
     score_ = 0;
+    startMs_ = lastMs_;
+    beatBest_ = false;
     for (Obstacle& obstacle : obstacles_) obstacle.x = -100.0f;
     for (Obstacle& obstacle : obstacles_) respawn(obstacle);
   }
@@ -276,12 +315,15 @@ class Game {
   State state_ = State::Auto;
   bool moving_ = true;
   bool newBest_ = false;
+  bool beatBest_ = false;
+  bool onGround_ = true;
   float y_ = 0.0f;
   float vy_ = 0.0f;
   uint16_t score_ = 0;
   uint16_t best_ = 0;
   uint32_t lastMs_ = 0;
   uint32_t overMs_ = 0;
+  uint32_t startMs_ = 0;
   uint32_t seed_ = 0x2545F491U;
   int worldWidth_ = 80;
   Obstacle obstacles_[kObstacleCount]{};

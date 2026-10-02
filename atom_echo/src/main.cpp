@@ -5,6 +5,9 @@
 // Logging starting or stopping is announced as "T-Rex says, rawr! Is
 // logging" or "... Not logging".
 //
+// Logger choice: hold the main button and press the side reset button; it
+// says "Pairs with ..." for the next logger in turn.
+//
 // Button: tap to save a waypoint, hold 1 s for a spoken status report, hold
 // 4 s to mute or unmute the automatic alerts (button replies always speak).
 // Light: blue blink = searching, amber = linked without a fix, green = fix,
@@ -22,11 +25,20 @@
 
 #include "Clips.h"
 #include "TelemetryProtocol.h"
+#include "Version.h"
 
 namespace {
 
-constexpr telemetry::LoggerBoard kLoggerBoard =
-    telemetry::LoggerBoard::CardputerAdv;
+// Which logger the Echo pairs with. Hold the main button while pressing the
+// side reset button to step to the next one; the choice is spoken and saved.
+constexpr telemetry::LoggerBoard kTargetBoards[] = {
+    telemetry::LoggerBoard::CardputerAdv, telemetry::LoggerBoard::Cardputer,
+    telemetry::LoggerBoard::Core2, telemetry::LoggerBoard::Unknown};
+constexpr size_t kTargetBoardCount =
+    sizeof(kTargetBoards) / sizeof(kTargetBoards[0]);
+// Read by the receive callback; a single byte, so no lock is needed.
+volatile uint8_t targetBoard =
+    static_cast<uint8_t>(telemetry::LoggerBoard::CardputerAdv);
 constexpr char kWaypointCategory[] = "MARK";
 constexpr uint8_t kChannels = 13;
 constexpr uint32_t kScanDwellMs = 450;
@@ -171,7 +183,8 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* bytes,
     std::memcpy(&discovery, bytes, sizeof(discovery));
     if (!telemetry::validatePacket(discovery, type) || currentlyPaired ||
         !telemetry::boardMatches(
-            kLoggerBoard, telemetry::beaconBoard(discovery.time_flags))) {
+            static_cast<telemetry::LoggerBoard>(targetBoard),
+            telemetry::beaconBoard(discovery.time_flags))) {
       return;
     }
     portENTER_CRITICAL(&receiveMux);
@@ -388,9 +401,30 @@ void updateRadio(uint32_t nowMs) {
   }
 }
 
+void sayPairing() {
+  switch (static_cast<telemetry::LoggerBoard>(targetBoard)) {
+    case telemetry::LoggerBoard::CardputerAdv: say(clips::pair_adv); break;
+    case telemetry::LoggerBoard::Cardputer: say(clips::pair_cardputer); break;
+    case telemetry::LoggerBoard::Core2: say(clips::pair_core2); break;
+    default: say(clips::pair_any); break;
+  }
+}
+
+void cycleTargetBoard() {
+  size_t index = 0;
+  while (index < kTargetBoardCount &&
+         static_cast<uint8_t>(kTargetBoards[index]) != targetBoard) {
+    ++index;
+  }
+  targetBoard =
+      static_cast<uint8_t>(kTargetBoards[(index + 1) % kTargetBoardCount]);
+  preferences.putUChar("target", targetBoard);
+}
+
 void speakStatus() {
   if (!paired || !haveStatus) {
     say(clips::no_logger);
+    sayPairing();  // A reminder of which logger it is waiting for.
     return;
   }
   if (status.fix_valid) say(clips::fix_ok);
@@ -542,6 +576,12 @@ void setup() {
   M5.Led.setBrightness(40);
   preferences.begin("echo", false);
   muted = preferences.getBool("muted", false);
+  targetBoard = preferences.getUChar(
+      "target", static_cast<uint8_t>(telemetry::LoggerBoard::CardputerAdv));
+  // Main button held through a reset: step to the next logger.
+  M5.update();
+  const bool changeTarget = M5.BtnA.isPressed();
+  if (changeTarget) cycleTargetBoard();
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -556,7 +596,10 @@ void setup() {
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
   Serial.printf("Atom Echo station MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  say(clips::ready);
+  Serial.printf("Firmware %s %s %s, pairs with board %u\n", version::kNumber,
+                version::kGit, version::kDate, targetBoard);
+  if (changeTarget) sayPairing();
+  else say(clips::ready);
 }
 
 void loop() {

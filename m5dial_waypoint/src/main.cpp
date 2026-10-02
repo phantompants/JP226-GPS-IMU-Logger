@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "DinoSprite.h"
+#include "Version.h"
 #include "TelemetryProtocol.h"
 
 namespace {
@@ -69,7 +70,9 @@ telemetry::DialCommandPacket pendingPacket{};
 uint32_t messageSinceMs = 0;
 long lastEncoderPosition = 0;
 bool longPressHandled = false;
-enum class DialPage : uint8_t { Drive, Waypoint, Settings, Link, About, Count };
+enum class DialPage : uint8_t {
+  Drive, Waypoint, Settings, Link, Version, About, Count
+};
 DialPage page = DialPage::Drive;
 bool editing = false;
 uint8_t categoryIndex = 0;
@@ -622,6 +625,16 @@ void drawLinkPage(M5Canvas& display, uint32_t nowMs) {
   drawHint(display, "TAP:CHANGE HOLD:PAGE");
 }
 
+void drawVersionPage(M5Canvas& display, uint32_t nowMs) {
+  dino::draw(display, kCenter - dino::kWidth, 40, 2,
+             (nowMs / 4000) % dino::kFrameCount);
+  centerText(display, 82, 2, TFT_CYAN, "SPECIES %s", version::kNumber);
+  centerText(display, 104, 2, YELLOW, "DNA %s", version::kGit);
+  centerText(display, 126, 2, GREEN, "%s", version::kDate);
+  centerText(display, 156, 2, ORANGE, "%s", version::jokeAt(nowMs));
+  drawHint(display, "HOLD: NEXT PAGE");
+}
+
 void drawAboutPage(M5Canvas& display, uint32_t nowMs) {
   // Inset from the round bezel so the dinosaur and the rocks stay visible.
   constexpr int kScale = 3;
@@ -631,20 +644,23 @@ void drawAboutPage(M5Canvas& display, uint32_t nowMs) {
   const float speed =
       haveStatus && latestStatus.fix_valid ? latestStatus.speed_kmh : -1.0f;
   dinoGame.update(nowMs, speed, kWidth / kScale);
-  if (dinoGame.takeNewBest()) preferences.putUShort("dino_best", dinoGame.best());
+  if (dinoGame.takeNewBest()) preferences.putUShort(dino::kBestKey, dinoGame.best());
   dinoGame.draw(display, kLeft, kGroundY, kWidth, kScale, nowMs);
   switch (dinoGame.state()) {
     case dino::Game::State::Ready:
       centerText(display, 38, 1, YELLOW, "TAP OR TURN TO PLAY");
       break;
     case dino::Game::State::Playing:
-      centerText(display, 38, 1, WHITE, "SCORE %u  BEST %u", dinoGame.score(),
-                 dinoGame.best());
+    case dino::Game::State::Over: {
+      char text[32];
+      dinoGame.statusText(text, sizeof(text));
+      centerText(display, 38, 1,
+                 dinoGame.state() == dino::Game::State::Playing ? WHITE
+                 : dinoGame.beatBest()                         ? GREEN
+                                                               : RED,
+                 "%s", text);
       break;
-    case dino::Game::State::Over:
-      centerText(display, 38, 1, RED, "GAME OVER %u  BEST %u",
-                 dinoGame.score(), dinoGame.best());
-      break;
+    }
     default:
       break;
   }
@@ -662,6 +678,7 @@ void draw() {
   const char* title = page == DialPage::Waypoint ? "WAYPOINT"
                       : page == DialPage::Settings ? "SETTINGS"
                       : page == DialPage::Link ? "CONNECTION"
+                      : page == DialPage::Version ? "FOSSIL RECORD"
                       : page == DialPage::About ? "JP226PRINTS"
                       : linked ? "LINKED" : "SEARCHING";
   centerText(display, 20, 2, linked ? GREEN : ORANGE, "%s", title);
@@ -670,6 +687,7 @@ void draw() {
     case DialPage::Waypoint: drawWaypointPage(display); break;
     case DialPage::Settings: drawSettingsPage(display); break;
     case DialPage::Link: drawLinkPage(display, millis()); break;
+    case DialPage::Version: drawVersionPage(display, millis()); break;
     case DialPage::About: drawAboutPage(display, millis()); break;
     default: break;
   }
@@ -693,7 +711,7 @@ void setup() {
   preferences.begin("dial", false);
   targetBoard = preferences.getUChar(
       "target", static_cast<uint8_t>(telemetry::LoggerBoard::CardputerAdv));
-  dinoGame.setBest(preferences.getUShort("dino_best", 0));
+  dinoGame.setBest(preferences.getUShort(dino::kBestKey, 0));
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   nextSequence = esp_random();

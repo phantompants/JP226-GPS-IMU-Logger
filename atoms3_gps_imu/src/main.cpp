@@ -14,6 +14,7 @@
 
 #include "AtomConfig.h"
 #include "DinoSprite.h"
+#include "Version.h"
 #include "TelemetryProtocol.h"
 
 namespace {
@@ -102,7 +103,9 @@ telemetry::DiscoveryPacket hostBeacon{};
 bool haveHostBeacon = false;
 uint32_t hostBeaconMs = 0;
 
-enum class Page : uint8_t { Combined, Imu, Gps, Time, Power, About, Count };
+enum class Page : uint8_t {
+  Combined, Imu, Gps, Time, Power, Version, About, Count
+};
 Page page = Page::Combined;
 M5Canvas canvas(&M5.Display);
 bool canvasReady = false;
@@ -776,16 +779,69 @@ void drawCalibrationPage() {
   canvas.setTextDatum(top_left);
 }
 
+dino::Game dinoGame;
+
+// This AtomS3's own GPS speed for the game; unknown counts as parked.
+float dinoGameSpeedKmh() {
+  return gps.speed.isValid() && gps.speed.age() <= atom_config::kGpsFreshMs
+             ? static_cast<float>(gps.speed.kmph())
+             : -1.0f;
+}
+
+void drawVersionPage(uint32_t nowMs) {
+  drawTitle("FOSSIL RECORD", TFT_CYAN);
+  dino::draw(canvas, canvas.width() - dino::kWidth * 2 - 2, 12, 2,
+             (nowMs / 4000) % dino::kFrameCount);
+  canvas.setTextSize(1);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  canvas.drawString("Species", 2, 16);
+  canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+  canvas.drawString(version::kNumber, 2, 26);
+  canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  canvas.drawString("DNA", 2, 50);
+  canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+  canvas.drawString(version::kGit, 30, 50);
+  canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  canvas.drawString("Hatched", 2, 64);
+  canvas.setTextColor(TFT_GREEN, TFT_BLACK);
+  canvas.drawString(version::kDate, 2, 76);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(TFT_ORANGE, TFT_BLACK);
+  canvas.drawString(version::jokeAt(nowMs), canvas.width() / 2, 104);
+  canvas.setTextDatum(top_left);
+}
+
 void drawAboutPage(uint32_t nowMs) {
   drawTitle("JP226PRINTS", TFT_CYAN);
-  constexpr int kScale = 3;
-  constexpr int kTop = 18;
-  constexpr int kGroundY = kTop + dino::kHeight * kScale + 1;
+  // Scale 2 leaves enough runway to see the rocks coming on 128 pixels.
+  constexpr int kScale = 2;
+  constexpr int kGroundY = 16 + dino::kHeight * kScale + 1;
   const int width = canvas.width();
-  dino::draw(canvas, dino::runX(nowMs, width, kScale), kTop, kScale,
-             dino::frameAt(nowMs));
-  for (int x = -static_cast<int>((nowMs / 25) % 10); x < width; x += 10) {
-    canvas.drawFastHLine(x, kGroundY, 5, TFT_DARKGREY);
+  dinoGame.update(nowMs, dinoGameSpeedKmh(), width / kScale);
+  if (dinoGame.takeNewBest()) preferences.putUShort(dino::kBestKey, dinoGame.best());
+  dinoGame.draw(canvas, 0, kGroundY, width, kScale, nowMs);
+  canvas.setTextSize(1);
+  canvas.setTextDatum(middle_center);
+  switch (dinoGame.state()) {
+    case dino::Game::State::Ready:
+      canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+      canvas.drawString("TAP: PLAY HOLD: PAGE", width / 2, 62);
+      break;
+    case dino::Game::State::Playing:
+    case dino::Game::State::Over: {
+      char text[32];
+      dinoGame.statusText(text, sizeof(text));
+      canvas.setTextColor(dinoGame.state() == dino::Game::State::Playing
+                              ? TFT_WHITE
+                          : dinoGame.beatBest() ? TFT_GREEN
+                                                : TFT_RED,
+                          TFT_BLACK);
+      canvas.drawString(text, width / 2, 62);
+      break;
+    }
+    default:
+      break;
   }
   canvas.setTextDatum(middle_center);
   canvas.setTextSize(1);
@@ -816,6 +872,7 @@ void drawStatus(uint32_t nowMs) {
       case Page::Gps: drawGpsPage(nowMs); break;
       case Page::Time: drawTimePage(nowMs); break;
       case Page::Power: drawPowerPage(nowMs); break;
+      case Page::Version: drawVersionPage(nowMs); break;
       case Page::About: drawAboutPage(nowMs); break;
       default: drawCombinedPage(nowMs); break;
     }
@@ -849,6 +906,7 @@ void setup() {
   calibration.pitchRad = preferences.getFloat("pitch", 0.0f);
   calibration.rollRad = preferences.getFloat("roll", 0.0f);
   calibration.gravityMps2 = preferences.getFloat("gravity", kGravityMps2);
+  dinoGame.setBest(preferences.getUShort(dino::kBestKey, 0));
   const uint8_t savedPage = preferences.getUChar("page", 0);
   if (savedPage < static_cast<uint8_t>(Page::Count)) {
     page = static_cast<Page>(savedPage);
@@ -871,13 +929,21 @@ void loop() {
   updateLink(nowMs);
   sendTelemetry(nowMs);
 
+  static bool pressOnGame = false;
+  if (M5.BtnA.wasPressed()) {
+    pressOnGame = page == Page::About &&
+                  dinoGame.state() != dino::Game::State::Auto;
+    if (pressOnGame) dinoGame.press(nowMs);
+  }
   if (M5.BtnA.pressedFor(1500) && !calibrationButtonLatched) {
     calibrationButtonLatched = true;
-    beginCalibration();
+    if (page == Page::About) nextPage();
+    else beginCalibration();
   }
   // A short press of the screen cycles pages; the hold above zeroes the mount.
+  // On the playable dinosaur page the press was a jump instead.
   if (M5.BtnA.wasReleased()) {
-    if (!calibrationButtonLatched) nextPage();
+    if (!calibrationButtonLatched && !pressOnGame) nextPage();
     calibrationButtonLatched = false;
   }
   drawStatus(nowMs);

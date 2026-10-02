@@ -33,12 +33,32 @@ movement-aware logging schedule.
 
 ## Dino-mite extras
 
-Every device with a screen (Cardputer, Core2, M5Dial and AtomS3) has a last
-page where a little pixel-art brontosaurus runs across the screen above
-**"Brought to you by JP226Prints"**. It does nothing useful, which makes it the
-most relaxed page in the whole firmware: no fix to chase, no SD card to worry
-about, just a dinosaur stretching its legs. Think of it as a *Jurassic
-lark*.
+Every device with a screen (Cardputer, Core2, M5Dial and AtomS3) ends with two
+dinosaur pages.
+
+**JP226PRINTS (last page): Dino Dash.** A little pixel-art brontosaurus above
+**"Brought to you by JP226Prints"**. While you are driving (over 5 km/h) it
+just runs along by itself. Park up (under 3 km/h) and it becomes a game: rocks
+and cacti scroll in and you jump. You can land on them and ride along, so only
+running into the side of one ends the game. Your score is the number of
+seconds you survive, and each device saves your personal best ("NEW PB 41s!").
+Think of it as a *Jurassic lark*.
+
+| Device | Jump | Leave the page |
+|---|---|---|
+| Cardputer | Space, Enter or `;` | Tab / `[` `]` |
+| Core2 | Tap the screen or the JUMP button | PREV / NEXT |
+| M5Dial | Press or turn the knob | Hold the button |
+| AtomS3 | Tap the screen | Hold the screen |
+
+**FOSSIL RECORD (second last): the version page.** Shows the firmware's
+*species* (version number), *DNA* (git commit; a `+` means it was built with
+uncommitted changes) and *hatched* date, under a rotating dino one-liner. Check
+it on each device to see exactly which code it is running. Test builds count
+up from `v0.10` (`v0.11`, `v0.12`, ...); `v1.0` will be the first public
+release, once it has been tested on every logger including the Cardputer ADV. The number lives in
+`shared/Version.h`; the commit and date are stamped in at build time by
+`shared/version.py`.
 
 The Atom Echo cannot show the dinosaur, so it speaks for it instead: "T-Rex
 says, rawr! Is logging" or "T-Rex says, rawr! Not logging". Short arms, big
@@ -310,7 +330,9 @@ and `ATOM REMOTE` on kit 3. The Grove cables to the AtomS3s carry power only.
 - **M5Dial:** tap on its CONNECTION page to choose CARDPUTER ADV, CARDPUTER,
   CORE2 or ANY LOGGER. The choice is saved, so moving it to another kit needs
   no reflash.
-- **Atom Echo:** `kLoggerBoard` at the top of `atom_echo/src/main.cpp`.
+- **Atom Echo:** hold its main button and press the small reset button on the
+  side. It restarts, steps to the next logger and says which one ("Pairs with
+  Cardputer ADV", "Cardputer", "Core 2" or "any logger"). The choice is saved.
 - **Logger:** accepts up to two controllers at once (Dial and Echo).
 
 Loggers with firmware older than this report no board type, and accessories
@@ -329,6 +351,7 @@ pins, so the firmware never uses it.
 | Tap | Save a `MARK` waypoint at the logger's position; it says "Waypoint saved" or "Waypoint not saved" |
 | Hold 1 s (tick), release | Spoken status: fix, logging, SD card and logger battery |
 | Hold 4 s (second tick), release | Mute or unmute the automatic alerts; remembered across restarts |
+| Hold, then press the side reset button | Choose the next logger to pair with, spoken aloud |
 
 Automatic alerts: logger connected or lost, logging started or stopped ("T-Rex
 says, rawr! Is logging" / "Not logging"), GPS fix gained or lost, AtomS3 link

@@ -15,13 +15,14 @@ enum class Core2Page : uint8_t {
   Logger,
   Time,
   Setup,
+  Version,
   About,
   Count,
 };
 
 constexpr const char* kCore2PageTitles[] = {
-    "DRIVE",  "HUD",  "GPS",   "IMU",        "WAYPOINT",
-    "LOGGER", "TIME", "SETUP", "JP226PRINTS"};
+    "DRIVE", "HUD",   "GPS",           "IMU",        "WAYPOINT",
+    "LOGGER", "TIME", "SETUP", "FOSSIL RECORD", "JP226PRINTS"};
 
 // Same categories as the M5Dial; the labels are shortened to fit a button.
 constexpr const char* kWaypointCategories[] = {
@@ -648,6 +649,20 @@ void drawCore2SetupPage(uint32_t nowMs) {
   drawButton(kBrighterBox, "+", TFT_WHITE);
 }
 
+void drawCore2VersionPage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  dino::draw(display, kScreenWidth - dino::kWidth * 3 - kMargin, 40, 3,
+             (nowMs / 4000) % dino::kFrameCount);
+  drawText(kMargin, 40, top_left, kFontSmall, TFT_LIGHTGREY, "SPECIES");
+  drawText(kMargin, 58, top_left, kFontBody, TFT_CYAN, "%s", version::kNumber);
+  drawText(kMargin, 90, top_left, kFontSmall, TFT_LIGHTGREY, "DNA");
+  drawText(kMargin, 108, top_left, kFontBody, TFT_YELLOW, "%s", version::kGit);
+  drawText(kMargin, 140, top_left, kFontSmall, TFT_LIGHTGREY, "HATCHED");
+  drawText(kMargin, 158, top_left, kFontBody, TFT_GREEN, "%s", version::kDate);
+  drawText(kScreenWidth / 2, 198, middle_center, kFontBody, TFT_ORANGE, "%s",
+           version::jokeAt(nowMs));
+}
+
 void drawCore2AboutPage(uint32_t nowMs) {
   auto& display = dashboardCanvas;
   constexpr int kScale = 4;
@@ -661,13 +676,16 @@ void drawCore2AboutPage(uint32_t nowMs) {
                "TAP TO PLAY");
       break;
     case dino::Game::State::Playing:
-      drawText(kScreenWidth - kMargin, 34, top_right, kFontSmall, TFT_WHITE,
-               "SCORE %u  BEST %u", dinoGame.score(), dinoGame.best());
+    case dino::Game::State::Over: {
+      char text[32];
+      dinoGame.statusText(text, sizeof(text));
+      drawText(kScreenWidth - kMargin, 34, top_right, kFontSmall,
+               dinoGame.state() == dino::Game::State::Playing ? TFT_WHITE
+               : dinoGame.beatBest()                         ? TFT_GREEN
+                                                             : TFT_RED,
+               "%s", text);
       break;
-    case dino::Game::State::Over:
-      drawText(kScreenWidth - kMargin, 34, top_right, kFontSmall, TFT_RED,
-               "GAME OVER %u  BEST %u", dinoGame.score(), dinoGame.best());
-      break;
+    }
     default:
       break;
   }
@@ -727,6 +745,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
       break;
     case Core2Page::Setup:
       drawCore2SetupPage(nowMs);
+      break;
+    case Core2Page::Version:
+      drawCore2VersionPage(nowMs);
       break;
     case Core2Page::About:
       drawCore2AboutPage(nowMs);

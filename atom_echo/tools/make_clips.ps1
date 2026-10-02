@@ -27,6 +27,10 @@ $phrases = [ordered]@{
   unmuted         = 'Alerts on'
   trex_logging    = 'T-Rex says, rawr! Is logging.'
   trex_not_logging = 'T-Rex says, rawr! Not logging.'
+  pair_adv        = 'Pairs with Cardputer A D V'
+  pair_cardputer  = 'Pairs with Cardputer'
+  pair_core2      = 'Pairs with Core 2'
+  pair_any        = 'Pairs with any logger'
 }
 
 $root = Split-Path -Parent $PSScriptRoot
