@@ -164,7 +164,9 @@ display:
     reset_pin: GPIO2
     color_depth: 8
     spi_mode: mode3
-    update_interval: 250ms
+    # A full redraw takes about 180 ms on the ESP8266; redrawing every 500 ms
+    # leaves time for Wi-Fi and the logger's broadcasts.
+    update_interval: 500ms
     id: disp
     lambda: |-
       const Color WHITE = Color(255, 255, 255);
