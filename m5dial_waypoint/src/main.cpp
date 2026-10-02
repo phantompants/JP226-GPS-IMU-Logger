@@ -302,6 +302,14 @@ void updateRadio(uint32_t nowMs) {
 
 TempProbes probes;
 
+// First probe that answered, or NaN.
+float firstProbeCelsius() {
+  for (int i = 0; i < probes.count(); ++i) {
+    if (!std::isnan(probes.reading(i).celsius)) return probes.reading(i).celsius;
+  }
+  return NAN;
+}
+
 void sendTemperatures(uint32_t nowMs) {
   static uint32_t lastMs = 0;
   static uint32_t sequence = 0;
@@ -655,14 +663,6 @@ void drawVersionPage(M5Canvas& display, uint32_t nowMs) {
   centerText(display, 126, 2, GREEN, "%s", version::kDate);
   centerText(display, 156, 2, ORANGE, "%s", version::jokeAt(nowMs));
   drawHint(display, "HOLD: NEXT PAGE");
-}
-
-// First probe that answered, or NaN.
-float firstProbeCelsius() {
-  for (int i = 0; i < probes.count(); ++i) {
-    if (!std::isnan(probes.reading(i).celsius)) return probes.reading(i).celsius;
-  }
-  return NAN;
 }
 
 void drawAboutPage(M5Canvas& display, uint32_t nowMs) {
