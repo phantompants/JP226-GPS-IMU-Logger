@@ -2,12 +2,30 @@
 
 #include <Arduino.h>
 
+// Set to 1 by the m5stack-core2 build; the Cardputer build leaves it unset.
+#ifndef JP226_CORE2
+#define JP226_CORE2 0
+#endif
+
 namespace config {
 
 // UART NMEA GPS inputs. The Grove port accepts the AT6558 and other standard
 // NMEA 0183 receivers. Its common baud rates are scanned automatically.
+#if JP226_CORE2
+// Core2 DIN base black Port B (G36/G26). The logger only listens to the GPS,
+// so no TX pin is assigned: G36 is input-only and must never be driven. GPS
+// TX may be wired to either line, so after a full baud scan the receive pin
+// swaps and the scan repeats.
+constexpr int kGroveGpsRxPin = 36;
+constexpr int kGroveGpsTxPin = -1;
+constexpr int kGroveGpsAltRxPin = 26;
+constexpr int kGroveGpsAltTxPin = -1;
+#else
 constexpr int kGroveGpsRxPin = 1;
 constexpr int kGroveGpsTxPin = 2;
+constexpr int kGroveGpsAltRxPin = -1;
+constexpr int kGroveGpsAltTxPin = -1;
+#endif
 constexpr uint32_t kGroveGpsBaudCandidates[] = {9600, 115200, 38400,
                                                 4800, 19200,  57600};
 constexpr size_t kGroveGpsBaudCandidateCount =
@@ -82,10 +100,17 @@ constexpr uint32_t kSdRetryIntervalMs = 10'000;
 constexpr uint32_t kClockResyncIntervalMs = 60'000;
 constexpr uint32_t kPersistedStopMaxAgeSec = 30UL * 24UL * 60UL * 60UL;
 
+#if JP226_CORE2
+constexpr int kSdSckPin = 18;
+constexpr int kSdMisoPin = 38;
+constexpr int kSdMosiPin = 23;
+constexpr int kSdCsPin = 4;
+#else
 constexpr int kSdSckPin = 40;
 constexpr int kSdMisoPin = 39;
 constexpr int kSdMosiPin = 14;
 constexpr int kSdCsPin = 12;
+#endif
 constexpr uint32_t kSdFrequencyHz = 25'000'000;
 
 constexpr char kLogDirectory[] = "/telemetry";

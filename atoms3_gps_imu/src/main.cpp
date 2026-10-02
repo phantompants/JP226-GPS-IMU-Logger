@@ -3,6 +3,7 @@
 #include <Preferences.h>
 #include <TinyGPSPlus.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
@@ -12,6 +13,7 @@
 #include <cstring>
 
 #include "AtomConfig.h"
+#include "DinoSprite.h"
 #include "TelemetryProtocol.h"
 
 namespace {
@@ -100,7 +102,7 @@ telemetry::DiscoveryPacket hostBeacon{};
 bool haveHostBeacon = false;
 uint32_t hostBeaconMs = 0;
 
-enum class Page : uint8_t { Combined, Imu, Gps, Time, Power, Count };
+enum class Page : uint8_t { Combined, Imu, Gps, Time, Power, About, Count };
 Page page = Page::Combined;
 M5Canvas canvas(&M5.Display);
 bool canvasReady = false;
@@ -299,6 +301,27 @@ void updateImu(uint32_t nowMs) {
   }
 }
 
+telemetry::LoggerBoard assignedBoard = telemetry::LoggerBoard::Unknown;
+
+void loadLoggerAssignment() {
+  uint8_t ownMac[6]{};
+  esp_read_mac(ownMac, ESP_MAC_WIFI_STA);
+  for (const auto& assignment : atom_config::kLoggerAssignments) {
+    if (std::memcmp(ownMac, assignment.atomMac, 6) == 0) {
+      assignedBoard = assignment.board;
+    }
+  }
+}
+
+const char* assignedBoardName() {
+  switch (assignedBoard) {
+    case telemetry::LoggerBoard::Cardputer: return "CARDPUTER";
+    case telemetry::LoggerBoard::CardputerAdv: return "CARDPUTER ADV";
+    case telemetry::LoggerBoard::Core2: return "CORE2";
+    default: return "ANY LOGGER";
+  }
+}
+
 bool configuredPeerAllowed(const uint8_t* mac) {
   return telemetry::macIsUnset(atom_config::kCardputerEspNowMac) ||
          std::memcmp(mac, atom_config::kCardputerEspNowMac, 6) == 0;
@@ -357,7 +380,9 @@ void receiveCallback(const esp_now_recv_info_t* info, const uint8_t* data,
   }
   telemetry::DiscoveryPacket packet{};
   std::memcpy(&packet, data, sizeof(packet));
-  if (!telemetry::validatePacket(packet, telemetry::PacketType::Discovery)) {
+  if (!telemetry::validatePacket(packet, telemetry::PacketType::Discovery) ||
+      !telemetry::boardMatches(assignedBoard,
+                               telemetry::beaconBoard(packet.time_flags))) {
     return;
   }
   const uint8_t channel = info->rx_ctrl == nullptr ? scanChannel
@@ -391,8 +416,10 @@ void beginEspNow() {
 void updateLink(uint32_t nowMs) {
   if (!espNowReady) return;
   if (havePeer) {
-    if (nowMs - std::max(lastPeerSeenMs, lastSendSuccessMs) <=
-        atom_config::kLinkTimeoutMs) {
+    // lastSendSuccessMs comes from the send callback and can be later than
+    // nowMs; elapsedMs() keeps that from looking like a 49-day silence.
+    const uint32_t lastHeardMs = std::max(lastPeerSeenMs, lastSendSuccessMs);
+    if (telemetry::elapsedMs(nowMs, lastHeardMs) <= atom_config::kLinkTimeoutMs) {
       return;
     }
     esp_now_del_peer(peerMac);
@@ -749,8 +776,34 @@ void drawCalibrationPage() {
   canvas.setTextDatum(top_left);
 }
 
+void drawAboutPage(uint32_t nowMs) {
+  drawTitle("JP226PRINTS", TFT_CYAN);
+  constexpr int kScale = 3;
+  constexpr int kTop = 18;
+  constexpr int kGroundY = kTop + dino::kHeight * kScale + 1;
+  const int width = canvas.width();
+  dino::draw(canvas, dino::runX(nowMs, width, kScale), kTop, kScale,
+             dino::frameAt(nowMs));
+  for (int x = -static_cast<int>((nowMs / 25) % 10); x < width; x += 10) {
+    canvas.drawFastHLine(x, kGroundY, 5, TFT_DARKGREY);
+  }
+  canvas.setTextDatum(middle_center);
+  canvas.setTextSize(1);
+  canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  canvas.drawString(dino::kCredit1, width / 2, 84);
+  // Size-2 built-in text is 132 px wide here, wider than the screen.
+  canvas.setFont(&fonts::FreeSansBold9pt7b);
+  canvas.setTextColor(TFT_CYAN, TFT_BLACK);
+  canvas.drawString(dino::kCredit2, width / 2, 104);
+  canvas.setFont(&fonts::Font0);
+  canvas.setTextDatum(top_left);
+}
+
 void drawStatus(uint32_t nowMs) {
-  if (nowMs - lastDisplayMs < atom_config::kDisplayIntervalMs) return;
+  // The dinosaur page animates; everything else refreshes twice a second.
+  const uint32_t interval =
+      page == Page::About ? 60 : atom_config::kDisplayIntervalMs;
+  if (nowMs - lastDisplayMs < interval) return;
   lastDisplayMs = nowMs;
   if (!canvasReady) return;
   canvas.fillScreen(TFT_BLACK);
@@ -763,6 +816,7 @@ void drawStatus(uint32_t nowMs) {
       case Page::Gps: drawGpsPage(nowMs); break;
       case Page::Time: drawTimePage(nowMs); break;
       case Page::Power: drawPowerPage(nowMs); break;
+      case Page::About: drawAboutPage(nowMs); break;
       default: drawCombinedPage(nowMs); break;
     }
   }

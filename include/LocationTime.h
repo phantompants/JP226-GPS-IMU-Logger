@@ -19,6 +19,7 @@ class LocationTime {
  private:
   void loadConfig(fs::FS& storage);
   void startWifi(uint32_t nowMs);
+  void startNtp();
   bool lookupTimezone(double latitude, double longitude);
   void applyTimezone(const String& rule, const String& name,
                      const char* source, bool persist);

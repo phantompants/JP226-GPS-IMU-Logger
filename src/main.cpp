@@ -1,5 +1,9 @@
 #include <Arduino.h>
+#if JP226_CORE2
+#include <M5Unified.h>
+#else
 #include <M5Cardputer.h>
+#endif
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
@@ -15,6 +19,7 @@
 #include <cstring>
 
 #include "Config.h"
+#include "DinoSprite.h"
 #include "KmlExporter.h"
 #include "LocationTime.h"
 #include "LogSchedule.h"
@@ -62,12 +67,14 @@ enum class DashboardPage : uint8_t {
   HudSpeed,
   GpsStatus,
   ImuStatus,
-  GpsSetup,
+  GpsSource,
+  ImuSource,
   Wifi,
   Logger,
   TimeNetwork,
   KmlExport,
   Waypoint,
+  About,
   Count,
 };
 
@@ -248,6 +255,12 @@ class GpsReceiver {
         gngsaVdop_(parser_, "GNGSA", 17),
         gpgsaVdop_(parser_, "GPGSA", 17) {}
 
+  // Takes effect at the next begin().
+  void setPins(int rxPin, int txPin) {
+    rxPin_ = rxPin;
+    txPin_ = txPin;
+  }
+
   void begin(uint32_t baud) {
     if (!started_) {
       serial_.setRxBufferSize(2048);
@@ -280,6 +293,8 @@ class GpsReceiver {
   bool started() const { return started_; }
   const char* name() const { return name_; }
   uint32_t baud() const { return baud_; }
+  int rxPin() const { return rxPin_; }
+  int txPin() const { return txPin_; }
   TinyGPSPlus& parser() { return parser_; }
   TinyGPSCustom& gngsaVdop() { return gngsaVdop_; }
   TinyGPSCustom& gpgsaVdop() { return gpgsaVdop_; }
@@ -302,7 +317,13 @@ GpsReceiver groveGps(1, "GROVE", config::kGroveGpsRxPin,
                      config::kGroveGpsTxPin);
 GpsReceiver capGps(2, "CAP", config::kCapGpsRxPin, config::kCapGpsTxPin);
 GpsReceiver* activeGps = &groveGps;
+#if JP226_CORE2
+// The Core2 microSD card shares the display's SPI bus, so the bus is never
+// stopped; only the SD driver is restarted on a retry.
+SPIClass& sdSpi = SPI;
+#else
 SPIClass sdSpi(FSPI);
+#endif
 Preferences preferences;
 ImuSampler imu;
 RemoteTelemetryReceiver remoteReceiver;
@@ -312,8 +333,21 @@ VehicleContext vehicleContext;
 LocationTime locationTime;
 KmlExporter kmlExporter;
 WebPortal webPortal;
+#if JP226_CORE2
+// No keyboard for the network list and password entry: the Core2 takes its
+// Wi-Fi credentials from logger.cfg on the SD card.
+struct NoWifiSetup {
+  bool active() const { return false; }
+  void update(uint32_t) {}
+  void draw(uint32_t) {}
+};
+NoWifiSetup wifiSetup;
+#else
 WifiSetupPage wifiSetup;
-M5Canvas dashboardCanvas(&M5Cardputer.Display);
+#endif
+// M5.Display, not M5Cardputer.Display: the latter is a reference member that
+// may not be bound yet when this global is constructed.
+M5Canvas dashboardCanvas(&M5.Display);
 File logFile;
 String currentLogPath;
 String lastKmlScanDate;
@@ -346,6 +380,7 @@ uint32_t tripStartedMs = 0;
 uint8_t displayBrightness = 128;
 size_t groveBaudIndex = 0;
 uint32_t groveBaudStartedMs = 0;
+bool grovePinsSwapped = false;
 time_t stopStartUtc = 0;
 time_t nextStoppedDueUtc = 0;
 time_t persistedStopStartUtc = 0;
@@ -366,6 +401,7 @@ bool waypointShowLast = false;
 String autoPlace;
 int8_t batteryPercent = telemetry::kBatteryUnknown;
 uint16_t batteryMv = 0;
+bool batteryCharging = false;
 uint32_t lastBatteryMs = 0;
 uint32_t lastBeaconInfoMs = 0;
 
@@ -432,6 +468,22 @@ void syncClockFromTelemetry(const GpsSnapshot& gps, uint32_t nowMs) {
     gmtime_r(&epoch, &utc);
     M5.Rtc.setDateTime(&utc);
   }
+}
+
+// Boards with a battery-backed RTC (the Core2) keep UTC across power-off, so
+// logging can resume before the GPS has a fix.
+void restoreClockFromRtc() {
+  if (!M5.Rtc.isEnabled()) return;
+  const auto now = M5.Rtc.getDateTime();
+  if (now.date.year < 2024 || now.date.year > 2099 || now.date.month < 1 ||
+      now.date.month > 12 || now.date.date < 1 || now.date.date > 31) {
+    return;
+  }
+  const int64_t seconds =
+      daysFromCivil(now.date.year, now.date.month, now.date.date) * 86400LL +
+      now.time.hours * 3600LL + now.time.minutes * 60LL + now.time.seconds;
+  timeval value{static_cast<time_t>(seconds), 0};
+  settimeofday(&value, nullptr);
 }
 
 void syncRtcFromSystem(uint32_t nowMs) {
@@ -507,8 +559,22 @@ const char* telemetrySourceName(TelemetrySource source) {
       return "ATOMS3_REMOTE";
     case TelemetrySource::CardputerAdv:
       return "CARDPUTER_ADV";
+    case TelemetrySource::LocalGpsAtomImu:
+      return "LOCAL_GPS_ATOM_IMU";
     default:
       return "LOCAL_GPS";
+  }
+}
+
+// Short on-screen name for the selected source.
+const char* telemetrySourceLabel(TelemetrySource source) {
+  switch (source) {
+    case TelemetrySource::AtomS3Remote:
+      return "ATOM REMOTE";
+    case TelemetrySource::LocalGpsAtomImu:
+      return "GPS+ATOM IMU";
+    default:
+      return "LOCAL GPS";
   }
 }
 
@@ -518,6 +584,23 @@ NormalizedTelemetry takeLocalTelemetry() {
   result.imu = imu.latest();
   result.metadata.source = TelemetrySource::LocalGps;
   return result;
+}
+
+NormalizedTelemetry takeActiveTelemetry(uint32_t nowMs) {
+  switch (telemetrySource) {
+    case TelemetrySource::AtomS3Remote:
+      return remoteReceiver.snapshot(nowMs);
+    case TelemetrySource::LocalGpsAtomImu: {
+      NormalizedTelemetry result = takeLocalTelemetry();
+      const NormalizedTelemetry remote = remoteReceiver.snapshot(nowMs);
+      result.imu = remote.imu;
+      result.metadata = remote.metadata;
+      result.metadata.source = TelemetrySource::LocalGpsAtomImu;
+      return result;
+    }
+    default:
+      return takeLocalTelemetry();
+  }
 }
 
 void currentPoi(const GpsSnapshot& gps, String& poi, String& source,
@@ -816,7 +899,9 @@ bool mountSd(uint32_t nowMs, bool force) {
   if (!force && nowMs - lastSdAttemptMs < config::kSdRetryIntervalMs) return false;
   lastSdAttemptMs = nowMs;
   SD.end();
+#if !JP226_CORE2
   sdSpi.end();
+#endif
   sdSpi.begin(config::kSdSckPin, config::kSdMisoPin, config::kSdMosiPin,
               config::kSdCsPin);
   sdMounted = SD.begin(config::kSdCsPin, sdSpi, config::kSdFrequencyHz) &&
@@ -859,10 +944,9 @@ bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
   if (!clockIsReady() || !openDailyFile(nowUtc, nowMs)) return false;
 
   const GpsSnapshot& gpsSample = telemetryData.gps;
+  const bool remoteImu = usesRemoteImu(telemetryData.metadata.source);
   const ImuSample imuSample =
-      telemetryData.metadata.source == TelemetrySource::LocalGps
-          ? imu.snapshotAndResetRoughness()
-          : telemetryData.imu;
+      remoteImu ? telemetryData.imu : imu.snapshotAndResetRoughness();
   char utcTimestamp[40]{};
   char localTimestamp[48]{};
   formatUtcTimestamp(utcTimestamp, sizeof(utcTimestamp));
@@ -892,24 +976,19 @@ bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
   line.field(imuSample.rollDeg, 2, imuSample.valid);
   line.field(imuSample.gTotalMps2 / kStandardGravityMps2, 4,
              imuSample.valid);
-  const float roughnessMps2 =
-      telemetryData.metadata.source == TelemetrySource::LocalGps
-          ? imuSample.legacyRoughnessMps2
-          : imuSample.vibrationRmsMps2;
+  const float roughnessMps2 = remoteImu ? imuSample.vibrationRmsMps2
+                                        : imuSample.legacyRoughnessMps2;
   line.field(roughnessMps2 / kStandardGravityMps2, 5, imuSample.valid);
   line.append(",%s,%u,", localTimestamp, gpsSample.fixValid ? 1U : 0U);
   if (gpsSample.fixAgeMs != UINT32_MAX) {
     line.append("%lu", static_cast<unsigned long>(gpsSample.fixAgeMs));
   }
-  const char* imuType = telemetryData.metadata.source ==
-                                TelemetrySource::AtomS3Remote
-                            ? "MPU6886_REMOTE"
-                            : imu.typeName();
+  const char* imuType = remoteImu ? "MPU6886_REMOTE" : imu.typeName();
   line.append(",%u,%s,%s,%llu", imuSample.available ? 1U : 0U, imuType,
               modeName(mode),
               static_cast<unsigned long long>(esp_timer_get_time() / 1000ULL));
   line.append(",%s,", telemetrySourceName(telemetryData.metadata.source));
-  if (telemetryData.metadata.source == TelemetrySource::AtomS3Remote) {
+  if (remoteImu) {
     line.append("%lu", static_cast<unsigned long>(
                            telemetryData.metadata.remoteSequence));
   }
@@ -936,7 +1015,7 @@ bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
   } else {
     line.append(",");
   }
-  if (telemetryData.metadata.source == TelemetrySource::AtomS3Remote) {
+  if (remoteImu) {
     line.append(",%lu,%lu,%lu,%u",
                 static_cast<unsigned long>(telemetryData.metadata.packetsLost),
                 static_cast<unsigned long>(telemetryData.metadata.duplicates),
@@ -1048,6 +1127,13 @@ void updateGpsReceivers(uint32_t nowMs) {
       nowMs - groveBaudStartedMs >= config::kGpsBaudScanIntervalMs) {
     groveBaudIndex =
         (groveBaudIndex + 1) % config::kGroveGpsBaudCandidateCount;
+    // After a full pass of baud rates, try the Grove lines the other way round.
+    if (groveBaudIndex == 0 && config::kGroveGpsAltRxPin >= 0) {
+      grovePinsSwapped = !grovePinsSwapped;
+      groveGps.setPins(
+          grovePinsSwapped ? config::kGroveGpsAltRxPin : config::kGroveGpsRxPin,
+          grovePinsSwapped ? config::kGroveGpsAltTxPin : config::kGroveGpsTxPin);
+    }
     groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
     groveBaudStartedMs = nowMs;
     Serial.printf("Scanning Grove GPS at %lu baud\n",
@@ -1071,21 +1157,53 @@ void cycleGpsPreference() {
   lastDisplayMs = 0;
 }
 
-void cycleTelemetrySource() {
-  telemetrySource = telemetrySource == TelemetrySource::LocalGps
-                        ? TelemetrySource::AtomS3Remote
-                        : TelemetrySource::LocalGps;
+void setTelemetrySource(TelemetrySource source) {
+  telemetrySource = source;
   preferences.putUChar("tele_src", static_cast<uint8_t>(telemetrySource));
   immediateLogRequested = true;
   haveDashboardFrameHash = false;
   lastDisplayMs = 0;
 }
 
-// Cardputer and Cardputer ADV measure the battery through an ADC divider.
-// M5Unified cannot report charging on these boards.
+void cycleTelemetrySource() {
+  switch (telemetrySource) {
+    case TelemetrySource::LocalGps:
+      setTelemetrySource(TelemetrySource::AtomS3Remote);
+      break;
+    case TelemetrySource::AtomS3Remote:
+      setTelemetrySource(TelemetrySource::LocalGpsAtomImu);
+      break;
+    default:
+      setTelemetrySource(TelemetrySource::LocalGps);
+      break;
+  }
+}
+
+// GPS and IMU each come from this unit or from the AtomS3. GPS from the AtomS3
+// always brings its IMU too: there is no AtomS3-GPS-with-own-IMU mode.
+bool gpsFromAtom() { return telemetrySource == TelemetrySource::AtomS3Remote; }
+bool imuFromAtom() { return telemetrySource != TelemetrySource::LocalGps; }
+
+void toggleGpsSource() {
+  // Leaving the AtomS3's GPS keeps its IMU, which is what a unit without
+  // its own IMU needs; R on the IMU page switches that separately.
+  setTelemetrySource(gpsFromAtom() ? TelemetrySource::LocalGpsAtomImu
+                                   : TelemetrySource::AtomS3Remote);
+}
+
+// No change while GPS comes from the AtomS3, which always brings its IMU.
+void toggleImuSource() {
+  if (gpsFromAtom()) return;
+  setTelemetrySource(imuFromAtom() ? TelemetrySource::LocalGps
+                                   : TelemetrySource::LocalGpsAtomImu);
+}
+
+// Cardputer and Cardputer ADV measure the battery through an ADC divider, and
+// M5Unified cannot report charging on them. The Core2's power chip can.
 void updateBattery(uint32_t nowMs) {
   if (lastBatteryMs != 0 && nowMs - lastBatteryMs < 5000) return;
   lastBatteryMs = nowMs;
+  batteryCharging = M5.Power.isCharging() == m5::Power_Class::is_charging;
   const int32_t level = M5.Power.getBatteryLevel();
   const int32_t millivolts = M5.Power.getBatteryVoltage();
   if (level < 0 || level > 100 || millivolts <= 0) {
@@ -1116,6 +1234,15 @@ bool localUtcOffsetMinutes(time_t nowUtc, int16_t& minutes) {
   return true;
 }
 
+telemetry::LoggerBoard loggerBoard() {
+#if JP226_CORE2
+  return telemetry::LoggerBoard::Core2;
+#else
+  return isCardputerAdv() ? telemetry::LoggerBoard::CardputerAdv
+                          : telemetry::LoggerBoard::Cardputer;
+#endif
+}
+
 void updateBeaconInfo(uint32_t nowMs) {
   if (lastBeaconInfoMs != 0 && nowMs - lastBeaconInfoMs < 1000) return;
   lastBeaconInfoMs = nowMs;
@@ -1131,7 +1258,7 @@ void updateBeaconInfo(uint32_t nowMs) {
     }
   }
   remoteReceiver.setBeaconInfo(utc, offset, flags, batteryPercent,
-                               batteryMv);
+                               batteryMv, loggerBoard());
 }
 
 void setWaypointMessage(const String& message) {
@@ -1249,6 +1376,12 @@ void sendDialStatus(uint32_t nowMs) {
   status.log_mode = static_cast<uint8_t>(mode);
   status.source = static_cast<uint8_t>(activeTelemetry.metadata.source);
   status.battery_percent = batteryPercent;
+  status.logger_board = static_cast<uint8_t>(loggerBoard());
+  if (remoteReceiver.snapshot(nowMs).metadata.remoteConnected) {
+    status.link_flags |= telemetry::AtomLinked;
+  }
+  if (locationTime.wifiConnected()) status.link_flags |= telemetry::WifiOnline;
+  if (sdMounted) status.link_flags |= telemetry::SdReady;
   vehicleContext.roadType.toCharArray(status.road, sizeof(status.road));
   vehicleContext.suspensionFront.toCharArray(
       status.suspension_front, sizeof(status.suspension_front));
@@ -1268,6 +1401,86 @@ void sendDialStatus(uint32_t nowMs) {
   telemetry::sealPacket(status);
   remoteReceiver.sendDialStatus(status, nowMs);
 }
+
+String displayClip(const String& value, size_t maximum) {
+  if (value.length() <= maximum) return value;
+  if (maximum <= 3) return value.substring(0, maximum);
+  return value.substring(0, maximum - 3) + "...";
+}
+
+void drawMirroredSevenSegmentDigit(M5Canvas& display, char character, int x,
+                                   int y, int width, int height, int thickness,
+                                   uint16_t color) {
+  constexpr uint8_t digitSegments[10] = {
+      0x3F, 0x06, 0x5B, 0x4F, 0x66,
+      0x6D, 0x7D, 0x07, 0x7F, 0x6F,
+  };
+  uint8_t segments = character == '-' ? 0x40 :
+                     (character >= '0' && character <= '9'
+                          ? digitSegments[character - '0']
+                          : 0);
+
+  auto mirroredRect = [&](int offsetX, int offsetY, int rectWidth,
+                          int rectHeight) {
+    display.fillRect(x + width - offsetX - rectWidth, y + offsetY, rectWidth,
+                     rectHeight, color);
+  };
+  const int half = height / 2;
+  if (segments & 0x01) mirroredRect(thickness, 0, width - 2 * thickness, thickness);
+  if (segments & 0x02) mirroredRect(width - thickness, thickness, thickness,
+                                    half - thickness);
+  if (segments & 0x04) mirroredRect(width - thickness, half, thickness,
+                                    half - thickness);
+  if (segments & 0x08) mirroredRect(thickness, height - thickness,
+                                    width - 2 * thickness, thickness);
+  if (segments & 0x10) mirroredRect(0, half, thickness, half - thickness);
+  if (segments & 0x20) mirroredRect(0, thickness, thickness, half - thickness);
+  if (segments & 0x40) mirroredRect(thickness, half - thickness / 2,
+                                    width - 2 * thickness, thickness);
+}
+
+// Status colours shared by every page: red when something has failed or been
+// lost, orange while waiting, green when good.
+constexpr uint16_t kStatusBad = TFT_RED;
+constexpr uint16_t kStatusWait = TFT_ORANGE;
+constexpr uint16_t kStatusGood = TFT_GREEN;
+// Accelerometer and gyro axes, matching the AtomS3's IMU page.
+constexpr uint16_t kAxisXColor = TFT_RED;
+constexpr uint16_t kAxisYColor = TFT_GREEN;
+constexpr uint16_t kAxisZColor = 0x54BF;  // Light blue; pure blue is dim.
+
+dino::Game dinoGame;
+
+// Speed fed to the dinosaur game; unknown speed counts as parked.
+float dinoGameSpeedKmh() {
+  return activeTelemetry.gps.speedFresh ? activeTelemetry.gps.speedKmh : -1.0f;
+}
+
+void saveDinoBest() {
+  if (dinoGame.takeNewBest()) preferences.putUShort("dino_best", dinoGame.best());
+}
+
+uint16_t logModeColor(LogMode value) {
+  switch (value) {
+    case LogMode::Moving: return kStatusGood;
+    case LogMode::FixLost: return kStatusBad;
+    case LogMode::StoppedFirstHour:
+    case LogMode::StoppedHourly: return TFT_WHITE;
+    default: return kStatusWait;
+  }
+}
+
+// Prints `label` in white and `value` in `color`, leaving the colour white.
+void printStatus(M5Canvas& display, const char* label, uint16_t color,
+                 const char* value) {
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.print(label);
+  display.setTextColor(color, TFT_BLACK);
+  display.print(value);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+#if !JP226_CORE2  // Cardputer UI: keyboard, 240x135
 
 void beginWaypointEdit(WaypointEditor field) {
   if (!waypointStore.hasLast()) {
@@ -1366,7 +1579,10 @@ void handleControls() {
   }
 
   auto& keys = M5Cardputer.Keyboard.keysState();
-  if (M5Cardputer.Keyboard.isKeyPressed('s')) {
+  if (dashboardPage == DashboardPage::About &&
+      (keys.space || keys.enter || M5Cardputer.Keyboard.isKeyPressed(';'))) {
+    dinoGame.press(millis());
+  } else if (M5Cardputer.Keyboard.isKeyPressed('s')) {
     screenOn = !screenOn;
     if (screenOn) {
       M5Cardputer.Display.wakeup();
@@ -1384,7 +1600,13 @@ void handleControls() {
   } else if (M5Cardputer.Keyboard.isKeyPressed('g')) {
     cycleGpsPreference();
   } else if (M5Cardputer.Keyboard.isKeyPressed('r')) {
-    cycleTelemetrySource();
+    if (dashboardPage == DashboardPage::GpsSource) {
+      toggleGpsSource();
+    } else if (dashboardPage == DashboardPage::ImuSource) {
+      toggleImuSource();  // The page explains when GPS pins it to the AtomS3.
+    } else {
+      cycleTelemetrySource();
+    }
   } else if (M5Cardputer.Keyboard.isKeyPressed('p')) {
     selectDashboardPage(DashboardPage::Waypoint);
   } else if (dashboardPage == DashboardPage::Waypoint &&
@@ -1446,12 +1668,6 @@ const char* boardName() {
   }
 }
 
-String displayClip(const String& value, size_t maximum) {
-  if (value.length() <= maximum) return value;
-  if (maximum <= 3) return value.substring(0, maximum);
-  return value.substring(0, maximum - 3) + "...";
-}
-
 void drawPageTitle(const char* title, uint16_t color = TFT_CYAN) {
   auto& display = dashboardCanvas;
   display.setTextDatum(top_left);
@@ -1496,13 +1712,16 @@ void drawCombinedPage(const GpsSnapshot& sample) {
 
   display.setTextDatum(top_left);
   display.setTextSize(2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.setCursor(3, 73);
-  display.printf("GPS:%s SAT:%lu\n", sample.fixValid ? "FIX" : "WAIT",
-                 static_cast<unsigned long>(sample.satellites));
-  display.printf("IMU:%s  SD:%s\n",
-                 activeTelemetry.imu.available ? "OK" : "N/A",
-                 sdMounted ? "OK" : "ERR");
+  printStatus(display, "GPS:", sample.fixValid ? kStatusGood : kStatusWait,
+              sample.fixValid ? "FIX" : "WAIT");
+  display.printf(" SAT:%lu\n", static_cast<unsigned long>(sample.satellites));
+  const bool imuOk = activeTelemetry.imu.available;
+  printStatus(display, "IMU:", imuOk ? kStatusGood : kStatusBad,
+              imuOk ? "OK " : "N/A");
+  printStatus(display, " SD:", sdMounted ? kStatusGood : kStatusBad,
+              sdMounted ? "OK" : "ERR");
+  display.println();
   drawPageFooter();
 }
 
@@ -1520,37 +1739,6 @@ void drawSpeedPage(const GpsSnapshot& sample) {
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.drawString("km/h", display.width() / 2, 104);
   drawPageFooter();
-}
-
-void drawMirroredSevenSegmentDigit(M5Canvas& display, char character, int x,
-                                   int y, int width, int height, int thickness,
-                                   uint16_t color) {
-  constexpr uint8_t digitSegments[10] = {
-      0x3F, 0x06, 0x5B, 0x4F, 0x66,
-      0x6D, 0x7D, 0x07, 0x7F, 0x6F,
-  };
-  uint8_t segments = character == '-' ? 0x40 :
-                     (character >= '0' && character <= '9'
-                          ? digitSegments[character - '0']
-                          : 0);
-
-  auto mirroredRect = [&](int offsetX, int offsetY, int rectWidth,
-                          int rectHeight) {
-    display.fillRect(x + width - offsetX - rectWidth, y + offsetY, rectWidth,
-                     rectHeight, color);
-  };
-  const int half = height / 2;
-  if (segments & 0x01) mirroredRect(thickness, 0, width - 2 * thickness, thickness);
-  if (segments & 0x02) mirroredRect(width - thickness, thickness, thickness,
-                                    half - thickness);
-  if (segments & 0x04) mirroredRect(width - thickness, half, thickness,
-                                    half - thickness);
-  if (segments & 0x08) mirroredRect(thickness, height - thickness,
-                                    width - 2 * thickness, thickness);
-  if (segments & 0x10) mirroredRect(0, half, thickness, half - thickness);
-  if (segments & 0x20) mirroredRect(0, thickness, thickness, half - thickness);
-  if (segments & 0x40) mirroredRect(thickness, half - thickness / 2,
-                                    width - 2 * thickness, thickness);
 }
 
 void drawHudSpeedPage(const GpsSnapshot& sample) {
@@ -1596,7 +1784,7 @@ void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
   auto& display = dashboardCanvas;
   drawPageTitle("GPS STATUS");
   display.setTextSize(2);
-  display.setTextColor(sample.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.setTextColor(sample.fixValid ? kStatusGood : kStatusBad, TFT_BLACK);
   display.setCursor(3, 25);
   display.printf("%s  %lu SAT\n", sample.fixValid ? "FIX" : "NO FIX",
                  static_cast<unsigned long>(sample.satellites));
@@ -1607,12 +1795,16 @@ void drawGpsStatusPage(const GpsSnapshot& sample, uint32_t nowMs) {
     display.println("LAT --\nLON --");
   }
   if (telemetrySource == TelemetrySource::AtomS3Remote) {
-    display.printf("ATOM %s H:",
-                   activeTelemetry.metadata.remoteConnected ? "LIVE" : "LOST");
+    const bool live = activeTelemetry.metadata.remoteConnected;
+    printStatus(display, "ATOM ", live ? kStatusGood : kStatusBad,
+                live ? "LIVE" : "LOST");
   } else {
-    display.printf("%s %s H:", activeGps->name(),
-                   activeGps->live(nowMs) ? "LIVE" : "SCAN");
+    const bool live = activeGps->live(nowMs);
+    display.printf("%s ", activeGps->name());
+    printStatus(display, "", live ? kStatusGood : kStatusWait,
+                live ? "LIVE" : "SCAN");
   }
+  display.print(" H:");
   if (sample.hdopValid) display.printf("%.1f", sample.hdop);
   else display.print("--");
   display.println();
@@ -1627,45 +1819,87 @@ void drawImuStatusPage() {
   display.setCursor(3, 27);
   const ImuSample& value = activeTelemetry.imu;
   if (!value.available) {
-    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.setTextColor(kStatusBad, TFT_BLACK);
     display.println("IMU unavailable");
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.println(telemetrySource == TelemetrySource::AtomS3Remote
                         ? "REMOTE GPS/IMU LOST"
+                    : telemetrySource == TelemetrySource::LocalGpsAtomImu
+                        ? "ATOM IMU LOST"
                         : "Local IMU N/A");
-  } else {
-    display.setTextColor(value.valid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-    display.printf("%s %s\n",
-                   telemetrySource == TelemetrySource::AtomS3Remote
-                       ? "ATOM MPU6886"
-                       : imu.typeName(),
-                   value.valid ? "LIVE" : "WAIT");
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.printf("X:%+.1f Y:%+.1f\n", value.axMps2, value.ayMps2);
-    display.printf("Z:%+.1f V:%.2f\n", value.azMps2,
-                   value.vibrationRmsMps2);
-    display.printf("P:%+.1f R:%+.1f\n", value.pitchDeg, value.rollDeg);
-    display.setTextSize(1);
-    display.printf("m/s2; gyro X:%+.1f Y:%+.1f Z:%+.1f", value.gxDps,
-                   value.gyDps, value.gzDps);
+    drawPageFooter();
+    return;
+  }
+  display.setTextColor(value.valid ? kStatusGood : kStatusWait, TFT_BLACK);
+  display.printf("%s %s\n",
+                 usesRemoteImu(telemetrySource) ? "ATOM MPU6886"
+                                                : imu.typeName(),
+                 value.valid ? "LIVE" : "WAIT");
+  struct Reading {
+    uint16_t color;
+    const char* format;
+    float value;
+  };
+  // Acceleration X/Y/Z on the left; vibration, pitch and roll on the right.
+  const Reading left[3] = {{kAxisXColor, "X:%+.1f", value.axMps2},
+                           {kAxisYColor, "Y:%+.1f", value.ayMps2},
+                           {kAxisZColor, "Z:%+.1f", value.azMps2}};
+  const Reading right[3] = {{TFT_CYAN, "V:%.2f", value.vibrationRmsMps2},
+                            {TFT_WHITE, "P:%+.1f", value.pitchDeg},
+                            {TFT_WHITE, "R:%+.1f", value.rollDeg}};
+  constexpr int32_t kLeftX = 3;
+  constexpr int32_t kRightX = 124;
+  constexpr int32_t kRowY[3] = {45, 63, 81};
+  for (int row = 0; row < 3; ++row) {
+    display.setTextColor(left[row].color, TFT_BLACK);
+    display.setCursor(kLeftX, kRowY[row]);
+    display.printf(left[row].format, left[row].value);
+    display.setTextColor(right[row].color, TFT_BLACK);
+    display.setCursor(kRightX, kRowY[row]);
+    display.printf(right[row].format, right[row].value);
+  }
+  const Reading gyro[3] = {{kAxisXColor, "X:%+.1f ", value.gxDps},
+                           {kAxisYColor, "Y:%+.1f ", value.gyDps},
+                           {kAxisZColor, "Z:%+.1f", value.gzDps}};
+  display.setTextSize(1);
+  display.setCursor(kLeftX, 101);
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.print("m/s2  gyro ");
+  for (const Reading& axis : gyro) {
+    display.setTextColor(axis.color, TFT_BLACK);
+    display.printf(axis.format, axis.value);
   }
   drawPageFooter();
 }
 
-void drawGpsSetupPage(uint32_t nowMs) {
+// Big "FROM" line shared by the two source pages.
+void drawSourceHeading(bool fromAtom, const char* ownName) {
   auto& display = dashboardCanvas;
-  drawPageTitle("GPS SETUP");
   display.setTextSize(2);
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
   display.setCursor(3, 27);
-  display.printf("Source: %s\n",
-                 telemetrySource == TelemetrySource::AtomS3Remote ? "ATOM REMOTE"
-                                                                  : "LOCAL GPS");
-  if (telemetrySource == TelemetrySource::AtomS3Remote) {
-    display.setTextColor(activeTelemetry.metadata.remoteConnected ? TFT_GREEN
-                                                                  : TFT_ORANGE,
-                         TFT_BLACK);
-    display.printf("Remote: %s\n", remoteReceiver.statusText(nowMs));
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.print("FROM ");
+  display.setTextSize(3);
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.println(fromAtom ? "ATOMS3" : ownName);
+  display.setTextSize(2);
+}
+
+// AtomS3 link line used by both source pages.
+void printAtomLink(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  const bool live = activeTelemetry.metadata.remoteConnected;
+  display.setCursor(3, 57);
+  printStatus(display, "LINK ", live ? kStatusGood : kStatusBad,
+              live ? "LIVE" : remoteReceiver.statusText(nowMs));
+  display.println();
+}
+
+void drawGpsSourcePage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("GPS SOURCE");
+  drawSourceHeading(gpsFromAtom(), "OWN GPS");
+  if (gpsFromAtom()) {
+    printAtomLink(nowMs);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.printf("Seq:%lu Age:", static_cast<unsigned long>(
                                       activeTelemetry.metadata.remoteSequence));
@@ -1674,19 +1908,50 @@ void drawGpsSetupPage(uint32_t nowMs) {
                                      activeTelemetry.metadata.packetAgeMs));
     display.setTextSize(1);
     display.println(displayClip(remoteReceiver.peerMacText(), 24));
-    display.setTextSize(2);
   } else {
-    display.printf("Preferred: %s\n", gpsPreferenceName());
-    display.printf("Active: %s %lu\n", activeGps->name(),
+    const bool live = activeGps->live(nowMs);
+    display.setCursor(3, 57);
+    display.printf("%s %lu ", activeGps->name(),
                    static_cast<unsigned long>(activeGps->baud()));
-    display.setTextColor(activeGps->live(nowMs) ? TFT_GREEN : TFT_ORANGE,
-                         TFT_BLACK);
-    display.printf("Signal: %s\n",
-                   activeGps->live(nowMs) ? "NMEA LIVE" : "SCANNING");
+    printStatus(display, "", live ? kStatusGood : kStatusWait,
+                live ? "LIVE" : "SCAN");
+    display.println();
+    display.printf("Prefer: %s\n", gpsPreferenceName());
   }
-  display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.println("R:source G:local");
-  drawPageFooter("R:source  G:GPS");
+  drawPageFooter("R:own/atom G:grove/cap");
+}
+
+void drawImuSourcePage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("IMU SOURCE");
+  drawSourceHeading(imuFromAtom(), "OWN IMU");
+  if (imuFromAtom()) {
+    printAtomLink(nowMs);
+    const bool live = activeTelemetry.imu.available;
+    printStatus(display, "IMU ", live ? kStatusGood : kStatusBad,
+                live ? "ATOM MPU6886" : "NO DATA");
+    display.println();
+    if (gpsFromAtom()) {
+      display.setTextSize(1);
+      display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      display.println("Comes with the AtomS3's GPS; change GPS first");
+    }
+  } else {
+    const ImuSample local = imu.latest();
+    display.setCursor(3, 57);
+    if (!local.available) {
+      display.setTextColor(kStatusBad, TFT_BLACK);
+      display.println("NO IMU IN THIS UNIT");
+      display.setTextSize(1);
+      display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      display.println("Press R to use an AtomS3's IMU");
+    } else {
+      printStatus(display, "", local.valid ? kStatusGood : kStatusWait,
+                  imu.typeName());
+      display.println(local.valid ? " LIVE" : " WAIT");
+    }
+  }
+  drawPageFooter("R:own/atom");
 }
 
 void drawWifiPage() {
@@ -1708,7 +1973,7 @@ void drawWifiPage() {
     display.println("http://jp226-logger.local");
     display.setTextSize(2);
   } else {
-    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.setTextColor(kStatusBad, TFT_BLACK);
     display.println("OFFLINE");
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     const String saved = locationTime.wifiSsid();
@@ -1724,10 +1989,10 @@ void drawLoggerPage(time_t nowUtc) {
   drawPageTitle("LOGGER / SD");
   display.setTextSize(2);
   display.setCursor(3, 27);
-  display.setTextColor(sdMounted ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  display.setTextColor(sdMounted ? kStatusGood : kStatusBad, TFT_BLACK);
   display.printf("SD: %s  LOG: ON\n", sdMounted ? "READY" : "RETRY");
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.printf("State: %s\n", modeName(mode));
+  printStatus(display, "State: ", logModeColor(mode), modeName(mode));
+  display.println();
   display.printf("Rows: %llu\n", static_cast<unsigned long long>(rowsWritten));
   if (!currentLogPath.isEmpty()) {
     const int slash = currentLogPath.lastIndexOf('/');
@@ -1811,74 +2076,154 @@ void drawKmlExportPage() {
   drawPageFooter();
 }
 
+// Size-2 text fits 20 characters across and five rows between the title and
+// the two small hint lines, so each row carries one fact.
 void drawWaypointPage(const GpsSnapshot& gps, uint32_t nowMs) {
   auto& display = dashboardCanvas;
   drawPageTitle("WAYPOINT");
-  display.setTextSize(1);
-  display.setCursor(3, 23);
+  constexpr int kLarge = 20;
+  constexpr int kRowY[] = {22, 39, 56, 73, 90};
+  char line[48]{};
+  display.setTextDatum(top_left);
+  display.setTextSize(2);
+
+  char hdop[8] = "--";
+  if (gps.hdopValid) snprintf(hdop, sizeof(hdop), "%.1f", gps.hdop);
+  snprintf(line, sizeof(line), "%s %luSAT H%s", gps.fixValid ? "FIX" : "WAIT",
+           static_cast<unsigned long>(gps.satellites), hdop);
   display.setTextColor(gps.fixValid ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  display.printf("GPS %s  SAT %lu  HDOP ", gps.fixValid ? "FIX" : "WAIT",
-                 static_cast<unsigned long>(gps.satellites));
-  if (gps.hdopValid) display.printf("%.1f\n", gps.hdop);
-  else display.println("--");
+  display.drawString(line, 3, kRowY[0]);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
-  if (gps.positionFresh) {
-    display.printf("LAT %.7f  LON %.7f\n", gps.latitude, gps.longitude);
-  } else {
-    display.println("LAT --  LON --");
-  }
-  String poi;
-  String poiSource;
-  String waypointId;
-  currentPoi(gps, poi, poiSource, waypointId);
-  display.printf("POI: %s\n", displayClip(poi.isEmpty() ? "--" : poi, 31).c_str());
-  if (waypointStore.hasLast()) {
+
+  const bool editing = waypointEditor != WaypointEditor::Closed;
+  const bool messageActive = nowMs - waypointMessageStartedMs < 5000 &&
+                             !waypointMessage.isEmpty();
+  const bool haveLast = waypointStore.hasLast();
+  if (haveLast && waypointShowLast) {
     const auto& last = waypointStore.last();
-    display.printf("LAST %s  %s\n", last.id.c_str(),
-                   displayClip(last.name, 23).c_str());
-    if (gps.positionFresh) {
-      display.printf("DIST %.0f m  CAT %s\n",
-                     waypointStore.distanceFromLastM(gps.latitude,
-                                                     gps.longitude),
-                     displayClip(last.category, 13).c_str());
+    display.drawString(displayClip("LAST " + last.id + " " + last.name, kLarge),
+                       3, kRowY[1]);
+    display.drawString(displayClip(last.timestamp, kLarge), 3, kRowY[2]);
+    display.drawString(displayClip("NOTE " + last.note, kLarge), 3, kRowY[3]);
+    if (!editing && !messageActive) {
+      display.drawString(displayClip("PHOTO " + last.photoReference, kLarge),
+                         3, kRowY[4]);
     }
-    if (waypointShowLast) {
-      display.printf("AT %s\n", displayClip(last.timestamp, 27).c_str());
-      display.printf("NOTE %s\n", displayClip(last.note, 27).c_str());
-      display.printf("PHOTO %s\n", displayClip(last.photoReference, 26).c_str());
+  } else {
+    String poi;
+    String poiSource;
+    String waypointId;
+    currentPoi(gps, poi, poiSource, waypointId);
+    display.drawString(displayClip("POI " + (poi.isEmpty() ? String("--") : poi),
+                                   kLarge),
+                       3, kRowY[1]);
+    if (haveLast) {
+      const auto& last = waypointStore.last();
+      display.drawString(
+          displayClip("LAST " + last.id + " " + last.name, kLarge), 3,
+          kRowY[2]);
+      if (gps.positionFresh) {
+        snprintf(line, sizeof(line), "%.0fm %s",
+                 waypointStore.distanceFromLastM(gps.latitude, gps.longitude),
+                 last.category.c_str());
+        display.drawString(displayClip(line, kLarge), 3, kRowY[3]);
+      }
+    } else {
+      display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      display.drawString("NO WAYPOINTS YET", 3, kRowY[2]);
+      display.setTextColor(TFT_WHITE, TFT_BLACK);
     }
   }
-  if (waypointEditor != WaypointEditor::Closed) {
+
+  if (editing) {
     const char* label = waypointEditor == WaypointEditor::Name
                             ? "NAME"
                             : waypointEditor == WaypointEditor::Note ? "NOTE"
                                                                       : "PHOTO";
     display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.printf("%s: %s_\n", label,
-                   displayClip(waypointInput, 27).c_str());
-    display.println("Enter: save  Esc: cancel");
-  } else {
-    if (nowMs - waypointMessageStartedMs < 5000 &&
-        !waypointMessage.isEmpty()) {
-      display.setTextColor(TFT_GREEN, TFT_BLACK);
-      display.println(displayClip(waypointMessage, 32));
-    }
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.println("A:add N:name T:note F:photo V:last");
+    // Keep the end of the input visible while typing.
+    const size_t room = kLarge - strlen(label) - 2;
+    String shown = waypointInput;
+    if (shown.length() > room) shown = shown.substring(shown.length() - room);
+    display.drawString(String(label) + ":" + shown + "_", 3, kRowY[4]);
+  } else if (messageActive) {
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.drawString(displayClip(waypointMessage, kLarge), 3, kRowY[4]);
   }
+
+  display.setTextSize(1);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (gps.positionFresh) {
+    snprintf(line, sizeof(line), "LAT %.6f  LON %.6f", gps.latitude,
+             gps.longitude);
+    display.drawString(line, 3, 108);
+  } else {
+    display.drawString("LAT --  LON --", 3, 108);
+  }
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.drawString(editing ? "Enter: save  Esc: cancel"
+                             : "A:add N:name T:note F:photo V:last",
+                     3, 117);
   drawPageFooter("P:waypoint  [ ]:pages");
+}
+
+void drawAboutPage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("JP226PRINTS");
+  constexpr int kScale = 3;
+  constexpr int kGroundY = 26 + dino::kHeight * kScale + 1;
+  const int width = display.width();
+  dinoGame.update(nowMs, dinoGameSpeedKmh(), width / kScale);
+  saveDinoBest();
+  dinoGame.draw(display, 0, kGroundY, width, kScale, nowMs);
+  // Game text sits at the right of the title bar, clear of the dinosaur.
+  display.setTextDatum(top_right);
+  display.setTextSize(1);
+  switch (dinoGame.state()) {
+    case dino::Game::State::Ready:
+      display.setTextColor(TFT_YELLOW, TFT_BLACK);
+      display.drawString("SPACE: PLAY", width - 3, 14);
+      break;
+    case dino::Game::State::Playing:
+      display.setTextColor(TFT_WHITE, TFT_BLACK);
+      display.drawString(String("SCORE ") + dinoGame.score() + "  BEST " +
+                             dinoGame.best(),
+                         width - 3, 14);
+      break;
+    case dino::Game::State::Over:
+      display.setTextColor(TFT_RED, TFT_BLACK);
+      display.drawString(String("GAME OVER ") + dinoGame.score() + "  BEST " +
+                             dinoGame.best(),
+                         width - 3, 14);
+      break;
+    default:
+      break;
+  }
+  display.setTextDatum(middle_center);
+  display.setTextSize(1);
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.drawString(dino::kCredit1, display.width() / 2, 90);
+  display.setTextSize(3);
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.drawString(dino::kCredit2, display.width() / 2, 110);
+  display.setTextDatum(top_left);
+  drawPageFooter();
 }
 
 void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   if (!screenOn || wifiSetup.active()) return;
-  if (nowMs - lastDisplayMs < config::kDisplayIntervalMs) return;
+  // The dinosaur page animates; everything else refreshes twice a second.
+  const uint32_t interval = dashboardPage == DashboardPage::About
+                                ? 60
+                                : config::kDisplayIntervalMs;
+  if (nowMs - lastDisplayMs < interval) return;
   lastDisplayMs = nowMs;
 
   if (!dashboardCanvasReady) {
     auto& physicalDisplay = M5Cardputer.Display;
     physicalDisplay.fillScreen(TFT_BLACK);
     physicalDisplay.setTextSize(2);
-    physicalDisplay.setTextColor(TFT_ORANGE, TFT_BLACK);
+    physicalDisplay.setTextColor(TFT_RED, TFT_BLACK);
     physicalDisplay.setCursor(4, 35);
     physicalDisplay.println("Display buffer");
     physicalDisplay.println("unavailable");
@@ -1907,8 +2252,11 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
     case DashboardPage::ImuStatus:
       drawImuStatusPage();
       break;
-    case DashboardPage::GpsSetup:
-      drawGpsSetupPage(nowMs);
+    case DashboardPage::GpsSource:
+      drawGpsSourcePage(nowMs);
+      break;
+    case DashboardPage::ImuSource:
+      drawImuSourcePage(nowMs);
       break;
     case DashboardPage::Wifi:
       drawWifiPage();
@@ -1925,6 +2273,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
     case DashboardPage::Waypoint:
       drawWaypointPage(sample, nowMs);
       break;
+    case DashboardPage::About:
+      drawAboutPage(nowMs);
+      break;
     default:
       break;
   }
@@ -1939,12 +2290,84 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
   }
 }
 
+#else
+#include "Core2Ui.inc"
+#endif  // JP226_CORE2
+
+// Board, IMU, internal I2C devices and radio links, printed every 10 s from
+// 5 s after boot so a serial monitor opened after start-up still sees them.
+// Worst time per loop() step since the last hardware report, to find what
+// delays key handling: a key tapped and released within one slow pass is
+// never seen.
+enum LoopStep : uint8_t {
+  StepControls, StepGps, StepImu, StepRadio, StepClockWifi, StepStatus,
+  StepCsv, StepSd, StepKml, StepWeb, StepDraw, StepCount
+};
+constexpr const char* kLoopStepNames[StepCount] = {
+    "controls", "gps", "imu", "radio", "clock/wifi", "status",
+    "csv", "sd", "kml", "web", "draw"};
+uint32_t loopStepMaxUs[StepCount]{};
+uint32_t loopMaxUs = 0;
+uint32_t loopStepStartUs = 0;
+
+void markLoopStep(LoopStep step) {
+  const uint32_t nowUs = micros();
+  loopStepMaxUs[step] = std::max(loopStepMaxUs[step], nowUs - loopStepStartUs);
+  loopStepStartUs = nowUs;
+}
+
+void printLoopTiming() {
+  uint8_t order[StepCount];
+  for (uint8_t i = 0; i < StepCount; ++i) order[i] = i;
+  std::sort(order, order + StepCount, [](uint8_t a, uint8_t b) {
+    return loopStepMaxUs[a] > loopStepMaxUs[b];
+  });
+  Serial.printf("Loop max %lu ms; slowest:",
+                static_cast<unsigned long>(loopMaxUs / 1000));
+  for (uint8_t i = 0; i < 3; ++i) {
+    Serial.printf(" %s %lu ms", kLoopStepNames[order[i]],
+                  static_cast<unsigned long>(loopStepMaxUs[order[i]] / 1000));
+  }
+  Serial.println();
+  std::fill(loopStepMaxUs, loopStepMaxUs + StepCount, 0);
+  loopMaxUs = 0;
+}
+
+void printHardwareReport(uint32_t nowMs) {
+  static uint32_t lastReportMs = 0;
+  if (nowMs < 5000 || (lastReportMs != 0 && nowMs - lastReportMs < 10000)) {
+    return;
+  }
+  lastReportMs = nowMs;
+  bool found[0x80]{};
+  M5.In_I2C.scanID(found);
+  Serial.printf("\nBoard %d, IMU %s, battery %d%%, internal I2C:",
+                static_cast<int>(M5.getBoard()), imu.typeName(),
+                batteryPercent);
+  for (int address = 0x08; address < 0x78; ++address) {
+    if (found[address]) Serial.printf(" 0x%02X", address);
+  }
+  Serial.printf("\nSource %s, remote %s %s, IMU %s, Dial %s, channel %u\n",
+                telemetrySourceLabel(telemetrySource),
+                remoteReceiver.statusText(nowMs),
+                remoteReceiver.peerMacText().c_str(),
+                activeTelemetry.imu.available ? "live" : "unavailable",
+                remoteReceiver.dialConnected(nowMs) ? "connected" : "not seen",
+                WiFi.channel());
+  printLoopTiming();
+}
+
 void loadPersistentState() {
   preferences.begin("gpsimu", false);
+  dinoGame.setBest(preferences.getUShort("dino_best", 0));
   const uint8_t savedPage = preferences.getUChar("page", 0);
+#if JP226_CORE2
+  restoreCore2Page(savedPage);
+#else
   if (savedPage < static_cast<uint8_t>(DashboardPage::Count)) {
     dashboardPage = static_cast<DashboardPage>(savedPage);
   }
+#endif
   const uint8_t savedGpsPreference = preferences.getUChar("gps_src", 0);
   if (savedGpsPreference <= static_cast<uint8_t>(GpsPreference::Cap) &&
       (savedGpsPreference != static_cast<uint8_t>(GpsPreference::Cap) ||
@@ -1958,8 +2381,12 @@ void loadPersistentState() {
                                           TelemetrySource::LocalGps);
   const uint8_t savedTelemetrySource =
       preferences.getUChar("tele_src", defaultSource);
-  if (savedTelemetrySource <=
-      static_cast<uint8_t>(TelemetrySource::AtomS3Remote)) {
+  if (savedTelemetrySource ==
+          static_cast<uint8_t>(TelemetrySource::LocalGps) ||
+      savedTelemetrySource ==
+          static_cast<uint8_t>(TelemetrySource::AtomS3Remote) ||
+      savedTelemetrySource ==
+          static_cast<uint8_t>(TelemetrySource::LocalGpsAtomImu)) {
     telemetrySource = static_cast<TelemetrySource>(savedTelemetrySource);
   }
   if (preferences.getUChar("state", 0) == 2) {
@@ -1981,24 +2408,42 @@ void loadPersistentState() {
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  // Plugged into a PC with no serial monitor open, each print otherwise waits
+  // up to 2 s for a reader, stalling loop() long enough to miss key presses.
+  Serial.setTxTimeoutMs(0);
+#endif
   setenv("TZ", config::kPosixTimezone, 1);
   tzset();
 
   auto m5Config = M5.config();
+#if JP226_CORE2
+  M5.begin(m5Config);
+#else
   M5Cardputer.begin(m5Config, true);
-  M5Cardputer.Display.setRotation(1);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.setTextWrap(false);
-  M5Cardputer.Display.setBrightness(displayBrightness);
-  M5Cardputer.Display.fillScreen(TFT_BLACK);
-  M5Cardputer.Display.setCursor(2, 2);
-  M5Cardputer.Display.println("Starting GPS + IMU logger...");
+#endif
+  M5.Display.setRotation(1);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextWrap(false);
+  M5.Display.setBrightness(displayBrightness);
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setCursor(2, 2);
+  M5.Display.println("Starting GPS + IMU logger...");
+  restoreClockFromRtc();
 
+#if JP226_CORE2
+  // A 320x240 16-bit frame is 150 KB, so it lives in PSRAM.
+  dashboardCanvas.setPsram(true);
+  dashboardCanvas.setColorDepth(16);
+#else
   dashboardCanvas.setColorDepth(8);
+#endif
   dashboardCanvasReady =
-      dashboardCanvas.createSprite(M5Cardputer.Display.width(),
-                                   M5Cardputer.Display.height()) != nullptr;
+      dashboardCanvas.createSprite(M5.Display.width(), M5.Display.height()) !=
+      nullptr;
+#if !JP226_CORE2
   if (dashboardCanvasReady) wifiSetup.setCanvas(dashboardCanvas);
+#endif
 
   imu.begin();
   loadPersistentState();
@@ -2029,23 +2474,31 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t loopStartUs = micros();
+  loopStepStartUs = loopStartUs;
+#if JP226_CORE2
+  M5.update();
+#else
   M5Cardputer.update();
+#endif
   handleControls();
+  markLoopStep(StepControls);
 
   const uint32_t nowMs = millis();
   updateGpsReceivers(nowMs);
+  markLoopStep(StepGps);
   imu.update(nowMs);
+  markLoopStep(StepImu);
   remoteReceiver.update(nowMs);
 
-  activeTelemetry = telemetrySource == TelemetrySource::AtomS3Remote
-                        ? remoteReceiver.snapshot(nowMs)
-                        : takeLocalTelemetry();
+  activeTelemetry = takeActiveTelemetry(nowMs);
   telemetry::DialCommandPacket dialCommand{};
   if (remoteReceiver.popDialCommand(dialCommand)) {
     handleDialCommand(dialCommand);
   }
   const GpsSnapshot& gpsSample = activeTelemetry.gps;
   if (gpsSample.fixValid && tripStartedMs == 0) tripStartedMs = nowMs;
+  markLoopStep(StepRadio);
   syncClockFromTelemetry(gpsSample, nowMs);
   if (!wifiSetup.active()) {
     locationTime.update(gpsSample.latitude, gpsSample.longitude,
@@ -2072,14 +2525,17 @@ void loop() {
     }
     autoPlace = resolvedPlace;
   }
+  markLoopStep(StepClockWifi);
   syncRtcFromSystem(nowMs);
   const time_t nowUtc = time(nullptr);
   if (clockIsReady()) closeCompletedDailyFile(nowUtc);
   updateLoggingMode(gpsSample, nowMs, nowUtc);
   updateBattery(nowMs);
+  printHardwareReport(nowMs);
   updateBeaconInfo(nowMs);
   sendDialStatus(nowMs);
 
+  markLoopStep(StepStatus);
   if (clockIsReady() && logIsDue(nowMs, nowUtc) &&
       writeCsvRow(activeTelemetry, nowMs, nowUtc)) {
     onLogSucceeded(nowMs, nowUtc);
@@ -2087,6 +2543,7 @@ void loop() {
 #if ENABLE_RAW_IMU_LOGGING
   writeRawImuBatches(nowUtc, nowMs);
 #endif
+  markLoopStep(StepCsv);
 
   mountSd(nowMs);
   if (sdMounted && !locationTimeStarted) {
@@ -2097,6 +2554,7 @@ void loop() {
     placeResolver.begin(SD, config::kLoggerConfigPath);
     placeResolverStarted = true;
   }
+  markLoopStep(StepSd);
   if (sdMounted && clockIsReady()) {
     const String currentDate = localDateText(nowUtc);
     if (currentDate != lastKmlScanDate) {
@@ -2109,6 +2567,7 @@ void loop() {
     }
   }
 
+  markLoopStep(StepKml);
   WebPortalStatus webStatus;
   webStatus.sdMounted = sdMounted;
   webStatus.stationary = stationaryForFileWork();
@@ -2124,7 +2583,10 @@ void loop() {
   webStatus.kmlFailed = kmlExporter.failedCount();
   webStatus.kmlPoints = kmlExporter.pointsWritten();
   webPortal.update(webStatus);
+  markLoopStep(StepWeb);
   drawStatus(gpsSample, nowMs, nowUtc);
   wifiSetup.draw(nowMs);
+  markLoopStep(StepDraw);
+  loopMaxUs = std::max(loopMaxUs, micros() - loopStartUs);
   delay(2);
 }

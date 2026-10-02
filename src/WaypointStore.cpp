@@ -16,6 +16,7 @@ const char* sourceName(TelemetrySource source) {
   switch (source) {
     case TelemetrySource::AtomS3Remote: return "ATOMS3_REMOTE";
     case TelemetrySource::CardputerAdv: return "CARDPUTER_ADV";
+    case TelemetrySource::LocalGpsAtomImu: return "LOCAL_GPS_ATOM_IMU";
     default: return "LOCAL_GPS";
   }
 }

@@ -50,8 +50,7 @@ void LocationTime::begin(fs::FS& storage, Preferences& preferences) {
 
   if (!wifiSsid_.isEmpty()) {
     startWifi(millis());
-    configTime(0, 0, config::kNtpServer1, config::kNtpServer2,
-               config::kNtpServer3);
+    startNtp();
   }
 }
 
@@ -94,6 +93,15 @@ void LocationTime::loadConfig(fs::FS& storage) {
   }
 }
 
+// configTime(0, 0, ...) would also set TZ to UTC0 and throw away the zone
+// already chosen; configTzTime() starts the same NTP client but keeps it.
+void LocationTime::startNtp() {
+  const char* current = getenv("TZ");
+  const String zone = current != nullptr ? current : config::kPosixTimezone;
+  configTzTime(zone.c_str(), config::kNtpServer1, config::kNtpServer2,
+               config::kNtpServer3);
+}
+
 void LocationTime::startWifi(uint32_t nowMs) {
   if (wifiSsid_.isEmpty()) return;
   WiFi.mode(WIFI_STA);
@@ -122,8 +130,7 @@ void LocationTime::setWifiCredentials(const String& ssid,
   WiFi.disconnect(false, false);
   wifiStarted_ = false;
   startWifi(millis());
-  configTime(0, 0, config::kNtpServer1, config::kNtpServer2,
-             config::kNtpServer3);
+  startNtp();
 }
 
 void LocationTime::update(double latitude, double longitude, bool locationFresh,

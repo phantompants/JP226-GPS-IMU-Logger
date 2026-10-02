@@ -44,14 +44,45 @@ enum StatusFlag : std::uint16_t {
   ImuStatisticsValid = 1U << 10,
 };
 
-// DiscoveryPacket::time_flags
+// DiscoveryPacket::time_flags. Bits 4-7 carry the logger's LoggerBoard so
+// accessories can pick their own logger when several are in range. Loggers
+// built before this send 0 there.
 enum TimeFlag : std::uint8_t {
   UtcValid = 1U << 0,
   UtcOffsetValid = 1U << 1,
 };
+constexpr std::uint8_t kTimeFlagBoardShift = 4;
 
 // Battery percentage used when the sender cannot measure a battery.
 constexpr std::int8_t kBatteryUnknown = -1;
+
+// DialStatusPacket::logger_board. Loggers built before this field existed
+// send 0.
+enum class LoggerBoard : std::uint8_t {
+  Unknown = 0,
+  Cardputer = 1,
+  CardputerAdv = 2,
+  Core2 = 3,
+};
+
+inline LoggerBoard beaconBoard(std::uint8_t timeFlags) {
+  return static_cast<LoggerBoard>(timeFlags >> kTimeFlagBoardShift);
+}
+
+// Whether an accessory that belongs to `wanted` may pair with a logger whose
+// beacon reports `board`. Unknown on either side matches anything, so
+// accessories keep working with loggers that predate the board field.
+inline bool boardMatches(LoggerBoard wanted, LoggerBoard board) {
+  return wanted == LoggerBoard::Unknown || board == LoggerBoard::Unknown ||
+         wanted == board;
+}
+
+// DialStatusPacket::link_flags
+enum LinkFlag : std::uint8_t {
+  AtomLinked = 1U << 0,
+  WifiOnline = 1U << 1,
+  SdReady = 1U << 2,
+};
 
 #pragma pack(push, 1)
 
@@ -141,7 +172,9 @@ struct DialStatusPacket {
   char place[32];
   char last_waypoint[24];
   std::int8_t battery_percent;
-  std::uint8_t reserved0[3];
+  std::uint8_t logger_board;  // LoggerBoard
+  std::uint8_t link_flags;    // LinkFlag bits
+  std::uint8_t reserved0;
   std::uint32_t crc32;
 };
 
@@ -226,6 +259,14 @@ inline bool validatePacket(const Packet& packet, PacketType type) {
          packet.header.type == static_cast<std::uint8_t>(type) &&
          packet.header.size == sizeof(Packet) &&
          packet.crc32 == crc32(&packet, sizeof(Packet) - sizeof(packet.crc32));
+}
+
+// Milliseconds from `then` to `now`. Radio callbacks stamp `then` with
+// millis() on another task, so it can be a little later than a `now` read
+// earlier in loop(); plain `now - then` would then wrap to ~49 days and make
+// a live link look stale. A `then` in the future counts as zero.
+inline std::uint32_t elapsedMs(std::uint32_t now, std::uint32_t then) {
+  return static_cast<std::int32_t>(now - then) < 0 ? 0 : now - then;
 }
 
 inline bool macIsUnset(const std::uint8_t mac[6]) {

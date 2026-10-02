@@ -5,3 +5,6 @@
 .vscode/ipch/
 logger.cfg
 
+
+# Intermediate WAVs from atom_echo/tools/make_clips.ps1 (packed into src/Clips.h)
+atom_echo/clips/

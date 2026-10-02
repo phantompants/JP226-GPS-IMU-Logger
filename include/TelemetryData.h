@@ -6,7 +6,15 @@ enum class TelemetrySource : uint8_t {
   LocalGps = 0,
   AtomS3Remote = 1,
   CardputerAdv = 2,  // Reserved for a future fully-normalized ADV source.
+  // Position from the local GPS, motion from an AtomS3 over ESP-NOW. For
+  // boards without their own IMU.
+  LocalGpsAtomImu = 3,
 };
+
+inline bool usesRemoteImu(TelemetrySource source) {
+  return source == TelemetrySource::AtomS3Remote ||
+         source == TelemetrySource::LocalGpsAtomImu;
+}
 
 struct GpsSnapshot {
   bool fixValid = false;

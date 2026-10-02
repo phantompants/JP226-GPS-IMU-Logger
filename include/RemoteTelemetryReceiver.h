@@ -12,15 +12,18 @@ class RemoteTelemetryReceiver {
   void update(uint32_t nowMs);
   NormalizedTelemetry snapshot(uint32_t nowMs) const;
   bool popRawImuBatch(telemetry::RawImuBatchPacket& packet);
+  // Controllers (Dial, Atom Echo) share one command path. The ack for a
+  // popped command goes back to the controller that sent it.
   bool popDialCommand(telemetry::DialCommandPacket& packet);
   void sendDialStatus(const telemetry::DialStatusPacket& packet,
                       uint32_t nowMs);
   void sendDialAck(const telemetry::DialAckPacket& packet);
   bool dialConnected(uint32_t nowMs) const;
-  // Clock, UTC offset and battery copied into each discovery beacon.
+  uint8_t controllerCount(uint32_t nowMs) const;
+  // Clock, UTC offset, battery and board type copied into each beacon.
   void setBeaconInfo(uint32_t utcEpochS, int16_t utcOffsetMin,
                      uint8_t timeFlags, int8_t batteryPercent,
-                     uint16_t batteryMv);
+                     uint16_t batteryMv, telemetry::LoggerBoard board);
   bool ready() const { return ready_; }
   const char* statusText(uint32_t nowMs) const;
   String peerMacText() const;
@@ -34,6 +37,25 @@ class RemoteTelemetryReceiver {
   void acceptTelemetry(const telemetry::TelemetryPacket& packet,
                        const uint8_t* mac, uint32_t nowMs);
   void sendDiscovery(uint32_t nowMs);
+  bool controllerFresh(size_t slot, uint32_t nowMs) const;
+
+  static constexpr size_t kMaxControllers = 2;
+  static constexpr uint32_t kControllerStaleMs = 5'000;
+
+  struct Controller {
+    uint8_t mac[6]{};
+    uint8_t addedMac[6]{};
+    bool active = false;
+    bool peerAdded = false;
+    bool commandReady = false;
+    bool haveCommandSequence = false;
+    bool haveAck = false;
+    bool ackRepeatPending = false;
+    uint32_t lastMs = 0;
+    uint32_t lastCommandSequence = 0;
+    telemetry::DialCommandPacket command{};
+    telemetry::DialAckPacket lastAck{};
+  };
 
   static RemoteTelemetryReceiver* instance_;
   static constexpr size_t kRawQueueSize = 4;
@@ -41,28 +63,20 @@ class RemoteTelemetryReceiver {
   mutable portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
   telemetry::TelemetryPacket latest_{};
   telemetry::RawImuBatchPacket rawQueue_[kRawQueueSize]{};
-  telemetry::DialCommandPacket dialCommand_{};
-  telemetry::DialAckPacket lastDialAck_{};
+  Controller controllers_[kMaxControllers]{};
   uint8_t allowedMac_[6]{};
   uint8_t peerMac_[6]{};
-  uint8_t dialMac_[6]{};
   uint8_t rawHead_ = 0;
   uint8_t rawTail_ = 0;
   uint8_t rawCount_ = 0;
   bool havePacket_ = false;
   bool havePeer_ = false;
-  bool haveDial_ = false;
-  bool dialCommandReady_ = false;
-  bool dialPeerAdded_ = false;
-  bool haveDialCommandSequence_ = false;
-  bool haveDialAck_ = false;
-  bool dialAckRepeatPending_ = false;
+  size_t ackSlot_ = 0;
+  size_t nextCommandSlot_ = 0;
   bool ready_ = false;
   uint32_t lastPacketMs_ = 0;
   uint32_t lastDiscoveryMs_ = 0;
-  uint32_t lastDialMs_ = 0;
   uint32_t lastDialStatusMs_ = 0;
-  uint32_t lastDialCommandSequence_ = 0;
   uint32_t discoverySequence_ = 0;
   uint32_t beaconUtcEpochS_ = 0;
   uint32_t beaconUtcSetMs_ = 0;
@@ -70,6 +84,7 @@ class RemoteTelemetryReceiver {
   uint8_t beaconTimeFlags_ = 0;
   int8_t beaconBatteryPercent_ = telemetry::kBatteryUnknown;
   uint16_t beaconBatteryMv_ = 0;
+  uint8_t beaconBoard_ = 0;
   uint32_t packetsLost_ = 0;
   uint32_t duplicates_ = 0;
   uint32_t crcErrors_ = 0;

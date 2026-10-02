@@ -1,18 +1,26 @@
 # JP226-GPS-IMU-Logger
 
-An Arduino/PlatformIO telemetry logger for both the **M5Stack Cardputer ADV**
-and the **original Cardputer**. The same source and the same compiled app binary
-run on either model. M5Unified detects the board at runtime:
+An Arduino/PlatformIO telemetry logger for the **M5Stack Cardputer ADV**, the
+**original Cardputer** and the **M5Stack Core2**. Both Cardputers run the same
+compiled app binary, and M5Unified detects the board at runtime; the Core2 has
+its own build with a touch interface:
 
 - Cardputer ADV: logs the onboard BMI270 accelerometer and gyroscope.
-- Original Cardputer: leaves the IMU numeric fields empty and writes
-  `imu_available=0` and `imu_type=none`.
-- Either Cardputer can select `ATOMS3_REMOTE` and receive GPS plus MPU6886 IMU
-  telemetry from an AtomS3 fitted to an Atomic GPS Base over ESP-NOW.
+- Original Cardputer: has no IMU of its own; leave the IMU fields empty
+  (`imu_available=0`) or take motion data from an AtomS3.
+- Core2: touch-screen logger with a Grove GPS on a DIN base's Port B. Uses its
+  own IMU where fitted, or an AtomS3's (see [M5Stack Core2
+  version](#m5stack-core2-version)).
+- Any logger can take GPS plus MPU6886 IMU telemetry from an AtomS3 fitted to
+  an Atomic GPS Base over ESP-NOW, and pair with an M5Dial and an Atom Echo.
 
 The project builds successfully against Arduino-ESP32 3.3.9, M5Cardputer tag
 1.2.0, M5Unified 0.2.22 and TinyGPSPlus 1.1.0. The included app binary is ready
 for Cardputer Launcher.
+
+> **Why log with a dinosaur?** Because every trip deserves a good *tracks*
+> record. Our resident brontosaurus has been doing fieldwork since the
+> Jurassic, and it has never once lost a fossil, sorry, a *file*.
 
 ## Acknowledgements
 
@@ -23,11 +31,105 @@ IMU version. JP226-GPS-IMU-Logger retains its familiar live GPS display and
 display controls while adding IMU telemetry, daily rollover, and an always-on
 movement-aware logging schedule.
 
+## Dino-mite extras
+
+Every device with a screen (Cardputer, Core2, M5Dial and AtomS3) has a last
+page where a little pixel-art brontosaurus runs across the screen above
+**"Brought to you by JP226Prints"**. It does nothing useful, which makes it the
+most relaxed page in the whole firmware: no fix to chase, no SD card to worry
+about, just a dinosaur stretching its legs. Think of it as a *Jurassic
+lark*.
+
+The Atom Echo cannot show the dinosaur, so it speaks for it instead: "T-Rex
+says, rawr! Is logging" or "T-Rex says, rawr! Not logging". Short arms, big
+opinions.
+
 ## Support the project
+
+JP226-GPS-IMU-Logger was built for a charity drive. We drive a Jurassic Park
+tribute Ford Ranger and raise funds for **Variety – the Children's Charity**,
+which is also why there is a dinosaur in every corner of this firmware. You can
+donate to our team, **The Fast and the Fossilized**, on our
+[Variety 4WD Queensland fundraising page](https://www.variety4wdqld.com.au/t/thefastandthefossilized).
 
 If you like JP226-GPS-IMU-Logger and would like to support its continued
 development, donations are welcome through
 [JP226 Prints](https://jp226prints.au/).
+
+**Coming next:** a port to the **M5Stack CardputerZero** as soon as ours
+arrives.
+
+Want it on another device? Ports to other M5Stack (or ESP32) hardware are very
+possible, and a sufficiently generous donation is the fastest way to get a
+board to the top of the list. The dinosaur will happily learn a new screen
+size; it just needs feeding.
+
+## Not sure what to build? Ask your AI
+
+This project supports a lot of M5Stack combinations. Copy the prompt below into
+ChatGPT, Claude, Copilot, Gemini or another AI assistant, fill in the last
+section, and it will suggest the best setup for the devices you already own, or
+a shopping list for your budget. Check current prices and stock yourself before
+buying; AI assistants can be out of date.
+
+```text
+I want to build a GPS + IMU (motion) logger using the open-source
+JP226-GPS-IMU-Logger firmware for M5Stack devices. Using only the facts below,
+recommend the best configuration for me.
+
+WHAT THE FIRMWARE DOES
+- A "logger" records GPS position, speed and IMU motion to CSV files on a
+  microSD card, makes daily Google Earth KML files, saves waypoints, and can
+  sync its clock from GPS or Wi-Fi internet time.
+- Accessories talk to the logger by ESP-NOW radio (no cables for data). Several
+  loggers can run side by side; each accessory pairs with one logger type.
+
+LOGGERS (pick one per kit; each needs a microSD card)
+- M5Stack Cardputer ADV: keyboard + screen, built-in BMI270 IMU. GPS from a
+  Grove GPS unit, or the Cap LoRa-1262 (ADV only), which has a built-in GPS.
+- M5Stack Cardputer (original v1): keyboard + screen, NO IMU and no GPS. Needs
+  an AtomS3 for IMU (and its GPS base for GPS), or a Grove GPS plus an AtomS3
+  for the IMU.
+- M5Stack Core2 (touch screen): GPS from a Grove GPS unit. A Core2 DIN base
+  adds a battery and Grove Port B (GPS goes there) and Port C. Some Core2 units
+  have no IMU; then an AtomS3 provides it.
+
+GPS AND IMU OPTIONS
+- M5Stack Grove GPS unit (AT6558 or other NMEA receiver): plugs into a
+  logger's Grove port. Gives GPS only.
+- M5Stack AtomS3 (NOT AtomS3 Lite, which has no IMU or screen): sends its IMU
+  by radio. Fitted to an Atomic GPS Base it sends GPS and IMU. It needs 5 V
+  power, e.g. from the logger's Grove port or USB-C.
+- Source modes on the logger: own GPS + own IMU; GPS + IMU from an AtomS3;
+  own GPS + IMU from an AtomS3.
+
+OPTIONAL ACCESSORIES (one logger can take two at once)
+- M5Stack M5Dial: rotary knob + round screen. Saves categorised waypoints,
+  sets road type / tyre pressures / suspension / load, shows speed and link
+  status. Tap its CONNECTION page to choose which logger type it pairs with.
+- M5Stack Atom Echo: spoken alerts (fix lost, logger lost, SD error, low
+  battery, logging on/off) and a one-button waypoint marker. It can sit on an
+  Atomic SPK base for a louder speaker, but the base's SD slot must stay
+  EMPTY: its SD pins clash with the Echo's audio.
+- Not useful here: Atom Lite / Atom Matrix as a relay (adds nothing), and the
+  Atomic SPK base's SD card with an Atom Echo.
+
+THINGS EVERY KIT NEEDS
+- One logger, one GPS source, a microSD card (FAT32, 32 GB or smaller is the
+  safe choice), and an IMU source if you want motion data.
+
+PLEASE GIVE ME
+1. The best kit (or kits) I can build, with what plugs into what.
+2. The source mode to select on each logger.
+3. Anything I am missing, with a rough price, and the cheapest way to fill
+   the gap.
+4. Any combinations to avoid.
+
+MY SITUATION (fill in one or both)
+- Devices I already have: [e.g. Cardputer v1, AtomS3 with GPS base, M5Dial]
+- Or my budget and country: [e.g. AUD 150, Australia]
+- What I want to log: [e.g. 4WD trips, motorbike rides, cycling, testing]
+```
 
 ## Hardware
 
@@ -132,6 +234,120 @@ See [Remote node setup](docs/remote-node.md) for mounting, zeroing, pairing,
 flashing and troubleshooting, and [Telemetry protocol](docs/telemetry-protocol.md)
 for the packed wire format.
 
+## M5Stack Core2 version
+
+The same logger also builds for the **M5Stack Core2** (v1.0 with MPU6886 or
+v1.1 with BMI270). It keeps everything the Cardputer does (CSV logging, KML
+export, waypoints, web portal, AtomS3 remote and M5Dial remote) and replaces
+the keyboard with a touch UI sized for the 320x240 screen.
+
+**Hardware:** fit the Core2 to a DIN base and plug an M5Stack GPS Unit (AT6558
+or another NMEA receiver) into the black **Port B** Grove socket. The firmware
+listens on G36, scans the common baud rates, then tries G26 in case the lines
+are the other way round, so no wiring choice is needed. It never transmits to
+the GPS, because G36 is input-only. An AtomS3 IMU node can take its power from
+**Port C**; its data travels by radio, not over the cable. Logs go to the Core2's own microSD slot. The Core2's
+battery-backed clock keeps UTC across power-off, so logging resumes before the
+GPS has a fix.
+
+**Build and flash** over USB (the Core2 resets itself into download mode):
+
+```powershell
+platformio run -e m5stack-core2
+platformio run -e m5stack-core2 -t upload --upload-port COMx
+```
+
+**Controls:** the three touch buttons under the screen are **< PREV**, the
+page's action (shown in yellow in the footer) and **NEXT >**. Hold the middle
+button to turn the screen off; touch anywhere to turn it back on.
+
+| Page | Shows | Middle button / touch |
+|---|---|---|
+| DRIVE | Large speed, fix, log state, current place, trip time | MARK: save a GENERIC waypoint |
+| HUD | Mirrored speed for a windscreen reflection | MARK |
+| GPS | Fix, position, altitude, heading, HDOP, receiver and baud | SOURCE: cycles LOCAL GPS, ATOM REMOTE and GPS+ATOM IMU |
+| IMU | Acceleration and rotation per axis (X red, Y green, Z blue), pitch, roll, vibration | - |
+| WAYPOINT | Tap one of nine types to save a waypoint here | LAST: details of the last waypoint |
+| LOGGER | SD, log state, rows, current file, KML export progress | KML SCAN |
+| TIME | Local time and date, time zone, Wi-Fi and web address | - |
+| SETUP | Source, AtomS3 and M5Dial link, GPS receiver, IMU type, brightness | Touch the on-screen buttons |
+
+**No IMU?** Some Core2 units have no IMU in the main unit (the serial report
+lists no device at 0x68/0x69). Select **GPS+ATOM IMU** to keep the Grove GPS
+for position and take motion data from an AtomS3 running the remote firmware;
+the AtomS3 needs no GPS base for this. The original Cardputer, which also has
+no IMU, has the same option on its `R` key. CSV rows record the source as
+`LOCAL_GPS_ATOM_IMU` and the IMU type as `MPU6886_REMOTE`.
+
+**M5Dial:** the Core2 accepts a Dial just as the Cardputer does, but the Dial
+firmware as shipped pairs only with the Cardputer ADV (see the kit layout
+below). Change `kLoggerBoard` in `m5dial_waypoint/src/main.cpp` to
+`LoggerBoard::Core2` to use it here instead.
+
+**Wi-Fi:** there is no keyboard for the Wi-Fi setup page, so put the network
+name and password in `/telemetry/logger.cfg` on the SD card (see
+`logger.cfg.example`). Waypoint names and notes cannot be typed on the Core2;
+the waypoint type is recorded instead.
+
+## Running several loggers
+
+Each logger announces its board type in its discovery beacon, and every
+accessory pairs only with its own type, so three kits can run side by side, a
+small herd that never wanders into the wrong *Rex-tangle*:
+
+| Kit | Logger | GPS | IMU | Accessories |
+|---|---|---|---|---|
+| 1 | Cardputer ADV | Grove GPS Unit | Built in | M5Dial, Atom Echo |
+| 2 | Core2 on a DIN base | Grove GPS Unit on Port B | AtomS3 on SPK base, by radio | AtomS3 powered from Port C |
+| 3 | Cardputer v1 | AtomS3 on Atomic GPS Base, by radio | Same AtomS3 | AtomS3 powered from the Grove port |
+
+Set the source to `OWN GPS` / `LOCAL GPS` on kit 1, `GPS+ATOM IMU` on kit 2
+and `ATOM REMOTE` on kit 3. The Grove cables to the AtomS3s carry power only.
+
+- **AtomS3:** each one's logger is listed by its own MAC in
+  `kLoggerAssignments` in `atoms3_gps_imu/include/AtomConfig.h`. An unlisted
+  AtomS3 pairs with the first logger it hears.
+- **M5Dial:** tap on its CONNECTION page to choose CARDPUTER ADV, CARDPUTER,
+  CORE2 or ANY LOGGER. The choice is saved, so moving it to another kit needs
+  no reflash.
+- **Atom Echo:** `kLoggerBoard` at the top of `atom_echo/src/main.cpp`.
+- **Logger:** accepts up to two controllers at once (Dial and Echo).
+
+Loggers with firmware older than this report no board type, and accessories
+pair with them as before.
+
+## Atom Echo alerts
+
+`atom_echo/` turns an M5Stack Atom Echo into a speaking companion for the
+Cardputer ADV. It works on its own or on an Atomic SPK base: at start-up it
+detects the base and plays through the base's louder speaker instead. Leave the
+base's SD slot empty. Its SD card is wired to the Echo's microphone and speaker
+pins, so the firmware never uses it.
+
+| Button | Action |
+|---|---|
+| Tap | Save a `MARK` waypoint at the logger's position; it says "Waypoint saved" or "Waypoint not saved" |
+| Hold 1 s (tick), release | Spoken status: fix, logging, SD card and logger battery |
+| Hold 4 s (second tick), release | Mute or unmute the automatic alerts; remembered across restarts |
+
+Automatic alerts: logger connected or lost, logging started or stopped ("T-Rex
+says, rawr! Is logging" / "Not logging"), GPS fix gained or lost, AtomS3 link
+(only when the logger uses one), SD card error or recovery, and logger battery
+under 20% and 10%. A change must last 3 seconds before it is spoken, so a brief
+dropout will not make it *dino-sore*.
+
+Light: blinking blue while searching, amber when linked without a fix, green
+with a fix, white while waiting for a waypoint confirmation, and a short purple
+blink every 3 seconds when muted.
+
+```powershell
+platformio run -d atom_echo -t upload --upload-port COMx
+```
+
+The clips are generated with Windows text-to-speech. To change the wording,
+edit the phrases in `atom_echo/tools/make_clips.ps1` and run it from the
+`atom_echo` folder; it rewrites `src/Clips.h`.
+
 ## Controls
 
 | Key | Action |
@@ -141,7 +357,7 @@ for the packed wire format.
 | `1`–`9` | Open dashboard pages 1–9 directly |
 | `0` | Open the KML export page (page 10) |
 | `G` | Cycle GPS source (`AUTO`/`GROVE`/`CAP` on ADV) |
-| `R` | Switch telemetry mode between `LOCAL_GPS` and `ATOMS3_REMOTE` |
+| `R` | On GPS SOURCE: GPS from this unit or the AtomS3. On IMU SOURCE: IMU from this unit or the AtomS3 (GPS from the AtomS3 always brings its IMU). Elsewhere: cycle `LOCAL GPS`, `ATOM REMOTE` and `GPS+ATOM IMU` |
 | `W` | Open the Wi-Fi setup page and scan for nearby networks |
 | `K` | Open the KML page and rescan all finished days for missing exports |
 | `P` | Open the WAYPOINT page |
@@ -320,7 +536,8 @@ safer option if access is ever needed from outside the vehicle network.
 
 ## Google Earth and Google Maps KML export
 
-Every finished local-calendar-day CSV is automatically converted to:
+Dinosaurs left tracks for palaeontologists; this logger leaves them for Google
+Earth. Every finished local-calendar-day CSV is automatically converted to:
 
 ```text
 /telemetry/kml/telemetry_YYYY-MM-DD.kml
@@ -518,6 +735,7 @@ src/main.cpp              GPS, IMU, clock, NVS, SD, CSV and display logic
 shared/TelemetryProtocol.h  versioned 136-byte packet, CRC and raw batch format
 atoms3_gps_imu/           independent AtomS3 + Atomic GPS Base firmware
 m5dial_waypoint/           independent M5Dial control firmware
+atom_echo/                Atom Echo spoken alerts and waypoint button
 docs/                     remote setup and telemetry protocol reference
 logger.cfg.example        optional Starlink/Wi-Fi and timezone configuration
 test/test_schedule/       boundary and persisted-state unit tests

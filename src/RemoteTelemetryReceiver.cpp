@@ -95,21 +95,40 @@ void RemoteTelemetryReceiver::receive(const esp_now_recv_info_t* info,
       return;
     if (!telemetry::macIsUnset(config::kDialEspNowMac) &&
         std::memcmp(info->src_addr, config::kDialEspNowMac, 6) != 0) return;
+    const uint32_t nowMs = millis();
     portENTER_CRITICAL(&mux_);
-    if (!haveDial_ || std::memcmp(info->src_addr, dialMac_, 6) == 0) {
-      if (!haveDial_) std::memcpy(dialMac_, info->src_addr, 6);
-      haveDial_ = true;
-      lastDialMs_ = millis();
+    // Reuse this controller's slot, else a free one, else one gone stale.
+    Controller* slot = nullptr;
+    for (auto& controller : controllers_) {
+      if (controller.active &&
+          std::memcmp(controller.mac, info->src_addr, 6) == 0) {
+        slot = &controller;
+        break;
+      }
+    }
+    for (size_t i = 0; slot == nullptr && i < kMaxControllers; ++i) {
+      if (!controllerFresh(i, nowMs)) {
+        slot = &controllers_[i];
+        std::memcpy(slot->mac, info->src_addr, 6);
+        slot->active = true;
+        slot->commandReady = false;
+        slot->haveCommandSequence = false;
+        slot->haveAck = false;
+        slot->ackRepeatPending = false;
+      }
+    }
+    if (slot != nullptr) {
+      slot->lastMs = nowMs;
       if (packet.action !=
           static_cast<uint8_t>(telemetry::DialAction::Heartbeat)) {
-        if (haveDialCommandSequence_ &&
-            packet.sequence == lastDialCommandSequence_) {
-          dialAckRepeatPending_ = haveDialAck_;
+        if (slot->haveCommandSequence &&
+            packet.sequence == slot->lastCommandSequence) {
+          slot->ackRepeatPending = slot->haveAck;
         } else {
-          lastDialCommandSequence_ = packet.sequence;
-          haveDialCommandSequence_ = true;
-          dialCommand_ = packet;
-          dialCommandReady_ = true;
+          slot->lastCommandSequence = packet.sequence;
+          slot->haveCommandSequence = true;
+          slot->command = packet;
+          slot->commandReady = true;
         }
       }
     }
@@ -195,7 +214,9 @@ void RemoteTelemetryReceiver::sendDiscovery(uint32_t nowMs) {
   telemetry::preparePacket(packet, telemetry::PacketType::Discovery);
   packet.sequence = discoverySequence_++;
   packet.uptime_ms = nowMs;
-  packet.time_flags = beaconTimeFlags_;
+  packet.time_flags = static_cast<uint8_t>(
+      (beaconTimeFlags_ & 0x0FU) |
+      (beaconBoard_ << telemetry::kTimeFlagBoardShift));
   if (beaconTimeFlags_ & telemetry::UtcValid) {
     packet.utc_epoch_s =
         beaconUtcEpochS_ + (nowMs - beaconUtcSetMs_) / 1000U;
@@ -212,89 +233,147 @@ void RemoteTelemetryReceiver::setBeaconInfo(uint32_t utcEpochS,
                                             int16_t utcOffsetMin,
                                             uint8_t timeFlags,
                                             int8_t batteryPercent,
-                                            uint16_t batteryMv) {
+                                            uint16_t batteryMv,
+                                            telemetry::LoggerBoard board) {
   beaconUtcEpochS_ = utcEpochS;
   beaconUtcSetMs_ = millis();
   beaconUtcOffsetMin_ = utcOffsetMin;
   beaconTimeFlags_ = timeFlags;
   beaconBatteryPercent_ = batteryPercent;
   beaconBatteryMv_ = batteryMv;
+  beaconBoard_ = static_cast<uint8_t>(board) & 0x0FU;
+}
+
+bool RemoteTelemetryReceiver::controllerFresh(size_t slot,
+                                              uint32_t nowMs) const {
+  const Controller& controller = controllers_[slot];
+  return controller.active &&
+         telemetry::elapsedMs(nowMs, controller.lastMs) < kControllerStaleMs;
 }
 
 void RemoteTelemetryReceiver::update(uint32_t nowMs) {
   sendDiscovery(nowMs);
-  uint8_t mac[6]{};
-  bool addPeer = false;
-  portENTER_CRITICAL(&mux_);
-  if (haveDial_ && !dialPeerAdded_) {
-    std::memcpy(mac, dialMac_, 6);
-    addPeer = true;
-  }
-  portEXIT_CRITICAL(&mux_);
-  if (addPeer) {
-    esp_now_peer_info_t peer{};
-    std::memcpy(peer.peer_addr, mac, 6);
-    peer.channel = 0;
-    peer.ifidx = WIFI_IF_STA;
-    const esp_err_t result = esp_now_add_peer(&peer);
-    if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) {
+  for (auto& controller : controllers_) {
+    uint8_t mac[6]{};
+    uint8_t oldMac[6]{};
+    bool addPeer = false;
+    bool removeOld = false;
+    telemetry::DialAckPacket repeat{};
+    bool repeatReady = false;
+    portENTER_CRITICAL(&mux_);
+    if (controller.active &&
+        (!controller.peerAdded ||
+         std::memcmp(controller.addedMac, controller.mac, 6) != 0)) {
+      std::memcpy(mac, controller.mac, 6);
+      std::memcpy(oldMac, controller.addedMac, 6);
+      removeOld = controller.peerAdded;
+      addPeer = true;
+    }
+    if (controller.ackRepeatPending && controller.haveAck &&
+        controller.peerAdded) {
+      repeat = controller.lastAck;
+      std::memcpy(mac, controller.mac, 6);
+      controller.ackRepeatPending = false;
+      repeatReady = true;
+    }
+    portEXIT_CRITICAL(&mux_);
+    if (addPeer) {
+      // A slot taken over by a new controller drops the old one's peer entry,
+      // unless the other slot still talks to that address.
+      if (removeOld) {
+        bool shared = false;
+        for (const auto& other : controllers_) {
+          if (&other != &controller && other.peerAdded &&
+              std::memcmp(other.addedMac, oldMac, 6) == 0) shared = true;
+        }
+        if (!shared) esp_now_del_peer(oldMac);
+      }
+      esp_now_peer_info_t peer{};
+      std::memcpy(peer.peer_addr, mac, 6);
+      peer.channel = 0;
+      peer.ifidx = WIFI_IF_STA;
+      const esp_err_t result = esp_now_add_peer(&peer);
       portENTER_CRITICAL(&mux_);
-      dialPeerAdded_ = true;
+      if (result == ESP_OK || result == ESP_ERR_ESPNOW_EXIST) {
+        std::memcpy(controller.addedMac, mac, 6);
+        controller.peerAdded = true;
+      } else {
+        controller.peerAdded = false;
+      }
       portEXIT_CRITICAL(&mux_);
     }
-  }
-  telemetry::DialAckPacket repeat{};
-  bool repeatReady = false;
-  portENTER_CRITICAL(&mux_);
-  if (dialAckRepeatPending_ && haveDialAck_) {
-    repeat = lastDialAck_;
-    dialAckRepeatPending_ = false;
-    repeatReady = true;
-  }
-  portEXIT_CRITICAL(&mux_);
-  if (repeatReady && dialPeerAdded_) {
-    esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&repeat),
-                 sizeof(repeat));
+    if (repeatReady) {
+      esp_now_send(mac, reinterpret_cast<const uint8_t*>(&repeat),
+                   sizeof(repeat));
+    }
   }
 }
 
 bool RemoteTelemetryReceiver::popDialCommand(
     telemetry::DialCommandPacket& packet) {
+  bool ready = false;
   portENTER_CRITICAL(&mux_);
-  const bool ready = dialCommandReady_;
-  if (ready) {
-    packet = dialCommand_;
-    dialCommandReady_ = false;
+  // Take turns so one busy controller cannot starve the other.
+  for (size_t i = 0; i < kMaxControllers && !ready; ++i) {
+    const size_t slot = (nextCommandSlot_ + i) % kMaxControllers;
+    if (controllers_[slot].commandReady) {
+      packet = controllers_[slot].command;
+      controllers_[slot].commandReady = false;
+      ackSlot_ = slot;
+      nextCommandSlot_ = (slot + 1) % kMaxControllers;
+      ready = true;
+    }
   }
   portEXIT_CRITICAL(&mux_);
   return ready;
 }
 
 bool RemoteTelemetryReceiver::dialConnected(uint32_t nowMs) const {
+  return controllerCount(nowMs) > 0;
+}
+
+uint8_t RemoteTelemetryReceiver::controllerCount(uint32_t nowMs) const {
+  uint8_t count = 0;
   portENTER_CRITICAL(&mux_);
-  const bool connected = haveDial_ && nowMs - lastDialMs_ < 5000;
+  for (size_t i = 0; i < kMaxControllers; ++i) {
+    if (controllerFresh(i, nowMs)) ++count;
+  }
   portEXIT_CRITICAL(&mux_);
-  return connected;
+  return count;
 }
 
 void RemoteTelemetryReceiver::sendDialStatus(
     const telemetry::DialStatusPacket& packet, uint32_t nowMs) {
-  if (!ready_ || !dialPeerAdded_ || !dialConnected(nowMs) ||
-      nowMs - lastDialStatusMs_ < 500) return;
+  if (!ready_ || nowMs - lastDialStatusMs_ < 500) return;
   lastDialStatusMs_ = nowMs;
-  esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&packet),
-               sizeof(packet));
+  for (size_t i = 0; i < kMaxControllers; ++i) {
+    uint8_t mac[6]{};
+    portENTER_CRITICAL(&mux_);
+    const bool send = controllerFresh(i, nowMs) && controllers_[i].peerAdded;
+    std::memcpy(mac, controllers_[i].addedMac, 6);
+    portEXIT_CRITICAL(&mux_);
+    if (send) {
+      esp_now_send(mac, reinterpret_cast<const uint8_t*>(&packet),
+                   sizeof(packet));
+    }
+  }
 }
 
 void RemoteTelemetryReceiver::sendDialAck(
     const telemetry::DialAckPacket& packet) {
-  if (!ready_ || !dialPeerAdded_) return;
+  if (!ready_) return;
+  uint8_t mac[6]{};
   portENTER_CRITICAL(&mux_);
-  lastDialAck_ = packet;
-  haveDialAck_ = true;
+  Controller& controller = controllers_[ackSlot_];
+  controller.lastAck = packet;
+  controller.haveAck = true;
+  const bool send = controller.peerAdded;
+  std::memcpy(mac, controller.addedMac, 6);
   portEXIT_CRITICAL(&mux_);
-  esp_now_send(dialMac_, reinterpret_cast<const uint8_t*>(&packet),
-               sizeof(packet));
+  if (send) {
+    esp_now_send(mac, reinterpret_cast<const uint8_t*>(&packet),
+                 sizeof(packet));
+  }
 }
 
 NormalizedTelemetry RemoteTelemetryReceiver::snapshot(uint32_t nowMs) const {
@@ -323,7 +402,7 @@ NormalizedTelemetry RemoteTelemetryReceiver::snapshot(uint32_t nowMs) const {
   result.metadata.versionErrors = versionErrors;
   if (!havePacket) return result;
 
-  const uint32_t packetAge = nowMs - lastPacketMs;
+  const uint32_t packetAge = telemetry::elapsedMs(nowMs, lastPacketMs);
   const bool fresh = packetAge <= config::kRemoteStaleMs;
   result.metadata.remoteConnected = fresh;
   result.metadata.remoteSequence = packet.sequence;
@@ -402,8 +481,9 @@ const char* RemoteTelemetryReceiver::statusText(uint32_t nowMs) const {
   const uint32_t lastPacketMs = lastPacketMs_;
   portEXIT_CRITICAL(&mux_);
   if (!havePacket) return "SEARCHING";
-  return nowMs - lastPacketMs <= config::kRemoteStaleMs ? "CONNECTED"
-                                                        : "LOST";
+  return telemetry::elapsedMs(nowMs, lastPacketMs) <= config::kRemoteStaleMs
+             ? "CONNECTED"
+             : "LOST";
 }
 
 String RemoteTelemetryReceiver::peerMacText() const {
