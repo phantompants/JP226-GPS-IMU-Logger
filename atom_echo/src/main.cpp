@@ -25,6 +25,7 @@
 
 #include "Clips.h"
 #include "TelemetryProtocol.h"
+#include "TempProbe.h"
 #include "Version.h"
 
 namespace {
@@ -401,6 +402,23 @@ void updateRadio(uint32_t nowMs) {
   }
 }
 
+
+TempProbes probes;
+
+void sendTemperatures(uint32_t nowMs) {
+  static uint32_t lastMs = 0;
+  static uint32_t sequence = 0;
+  if (!paired || nowMs - lastMs < 10'000) return;
+  lastMs = nowMs;
+  telemetry::TemperatureReportPacket report{};
+  if (!makeTemperatureReport(probes, telemetry::ProbeSource::Echo, sequence++,
+                             report)) {
+    return;
+  }
+  esp_now_send(peerMac, reinterpret_cast<const uint8_t*>(&report),
+               sizeof(report));
+}
+
 void sayPairing() {
   switch (static_cast<telemetry::LoggerBoard>(targetBoard)) {
     case telemetry::LoggerBoard::CardputerAdv: say(clips::pair_adv); break;
@@ -600,12 +618,15 @@ void setup() {
                 version::kGit, version::kDate, targetBoard);
   if (changeTarget) sayPairing();
   else say(clips::ready);
+  probes.begin({26, 32});  // DS18B20 probes on the Grove port
 }
 
 void loop() {
   M5.update();
   const uint32_t nowMs = millis();
   updateRadio(nowMs);
+  probes.update(nowMs);
+  sendTemperatures(nowMs);
   handleButton(nowMs);
   updateSpeech();
   updateLed(nowMs);

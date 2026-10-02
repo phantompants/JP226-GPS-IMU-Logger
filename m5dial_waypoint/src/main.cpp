@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "DinoSprite.h"
+#include "TempProbe.h"
 #include "Version.h"
 #include "TelemetryProtocol.h"
 
@@ -296,6 +297,23 @@ void updateRadio(uint32_t nowMs) {
     pendingSequence = 0;
     showMessage("NO CONFIRMATION");
   }
+}
+
+
+TempProbes probes;
+
+void sendTemperatures(uint32_t nowMs) {
+  static uint32_t lastMs = 0;
+  static uint32_t sequence = 0;
+  if (!paired || nowMs - lastMs < 10'000) return;
+  lastMs = nowMs;
+  telemetry::TemperatureReportPacket report{};
+  if (!makeTemperatureReport(probes, telemetry::ProbeSource::Dial, sequence++,
+                             report)) {
+    return;
+  }
+  esp_now_send(peerMac, reinterpret_cast<const uint8_t*>(&report),
+               sizeof(report));
 }
 
 void cycleTargetBoard() {
@@ -622,6 +640,10 @@ void drawLinkPage(M5Canvas& display, uint32_t nowMs) {
   } else {
     centerText(display, 100, 2, ORANGE, "WAITING FOR STATUS");
   }
+  const float probe = firstProbeCelsius();
+  if (!std::isnan(probe)) {
+    centerText(display, 190, 1, TFT_CYAN, "PROBE %.1f C", probe);
+  }
   drawHint(display, "TAP:CHANGE HOLD:PAGE");
 }
 
@@ -633,6 +655,14 @@ void drawVersionPage(M5Canvas& display, uint32_t nowMs) {
   centerText(display, 126, 2, GREEN, "%s", version::kDate);
   centerText(display, 156, 2, ORANGE, "%s", version::jokeAt(nowMs));
   drawHint(display, "HOLD: NEXT PAGE");
+}
+
+// First probe that answered, or NaN.
+float firstProbeCelsius() {
+  for (int i = 0; i < probes.count(); ++i) {
+    if (!std::isnan(probes.reading(i).celsius)) return probes.reading(i).celsius;
+  }
+  return NAN;
 }
 
 void drawAboutPage(M5Canvas& display, uint32_t nowMs) {
@@ -712,6 +742,8 @@ void setup() {
   targetBoard = preferences.getUChar(
       "target", static_cast<uint8_t>(telemetry::LoggerBoard::CardputerAdv));
   dinoGame.setBest(preferences.getUShort(dino::kBestKey, 0));
+  // DS18B20 probes on Port B (G1/G2) or Port A (G13/G15).
+  probes.begin({1, 2, 13, 15});
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   nextSequence = esp_random();
@@ -728,6 +760,8 @@ void loop() {
   M5Dial.update();
   const uint32_t nowMs = millis();
   updateRadio(nowMs);
+  probes.update(nowMs);
+  sendTemperatures(nowMs);
   handleControls();
   static uint32_t lastDrawMs = 0;
   // The dinosaur page animates; everything else redraws four times a second.

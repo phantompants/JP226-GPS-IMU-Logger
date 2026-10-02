@@ -150,6 +150,23 @@ void RemoteTelemetryReceiver::receive(const esp_now_recv_info_t* info,
     portEXIT_CRITICAL(&mux_);
     return;
   }
+  if (type == telemetry::PacketType::TemperatureReport &&
+      length == static_cast<int>(sizeof(telemetry::TemperatureReportPacket))) {
+    telemetry::TemperatureReportPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (!telemetry::validatePacket(packet,
+                                   telemetry::PacketType::TemperatureReport) ||
+        packet.source == 0 || packet.source >= kProbeSources ||
+        packet.count > telemetry::kMaxTemperatureProbes) {
+      return;
+    }
+    portENTER_CRITICAL(&mux_);
+    temperatures_[packet.source] = packet;
+    temperatureMs_[packet.source] = millis();
+    haveTemperature_[packet.source] = true;
+    portEXIT_CRITICAL(&mux_);
+    return;
+  }
   if (!sourceAllowed(info->src_addr)) return;
   if (type == telemetry::PacketType::Telemetry &&
       length == static_cast<int>(sizeof(telemetry::TelemetryPacket))) {
@@ -398,6 +415,19 @@ bool RemoteTelemetryReceiver::blackBoxStatus(
   const bool have = haveBlackBox_;
   packet = blackBox_;
   ageMs = telemetry::elapsedMs(nowMs, lastBlackBoxMs_);
+  portEXIT_CRITICAL(&mux_);
+  return have;
+}
+
+bool RemoteTelemetryReceiver::temperatureReport(
+    telemetry::ProbeSource source, telemetry::TemperatureReportPacket& packet,
+    uint32_t& ageMs, uint32_t nowMs) const {
+  const size_t index = static_cast<size_t>(source);
+  if (index == 0 || index >= kProbeSources) return false;
+  portENTER_CRITICAL(&mux_);
+  const bool have = haveTemperature_[index];
+  packet = temperatures_[index];
+  ageMs = telemetry::elapsedMs(nowMs, temperatureMs_[index]);
   portEXIT_CRITICAL(&mux_);
   return have;
 }

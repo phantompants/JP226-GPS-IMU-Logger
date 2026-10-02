@@ -19,6 +19,16 @@ enum class PacketType : std::uint8_t {
   DialAck = 6,
   PositionReport = 7,   // Logger -> controllers, once a second.
   BlackBoxStatus = 8,   // Black box -> logger.
+  TemperatureReport = 9,  // Any accessory with DS18B20 probes -> logger.
+};
+
+// TemperatureReportPacket::source: which device the probes are plugged into.
+enum class ProbeSource : std::uint8_t {
+  Unknown = 0,
+  Dial = 1,
+  Echo = 2,
+  BlackBox = 3,
+  Logger = 4,  // The logger's own Grove port (Core2, or a Cardputer ADV)
 };
 
 enum class DialAction : std::uint8_t {
@@ -245,6 +255,19 @@ struct BlackBoxStatusPacket {
   std::uint32_t crc32;
 };
 
+// DS18B20 readings from an accessory, every ten seconds while paired.
+constexpr std::size_t kMaxTemperatureProbes = 4;
+struct TemperatureReportPacket {
+  PacketHeader header;
+  std::uint32_t sequence;
+  std::uint8_t source;  // ProbeSource
+  std::uint8_t count;   // Valid entries in probe_id / celsius
+  std::uint8_t reserved0[2];
+  std::uint16_t probe_id[kMaxTemperatureProbes];
+  float celsius[kMaxTemperatureProbes];  // NaN when a probe did not answer
+  std::uint32_t crc32;
+};
+
 // Optional raw stream. Acceleration is milli-g, gyro is 0.1 degree/second,
 // and time_offset_100us is in 100-microsecond ticks from batch_start_time_ms.
 struct RawImuSample {
@@ -282,6 +305,8 @@ static_assert(sizeof(DialCommandPacket) <= kEspNowV1PayloadLimit &&
 static_assert(sizeof(PositionReportPacket) <= kEspNowV1PayloadLimit &&
                   sizeof(BlackBoxStatusPacket) <= kEspNowV1PayloadLimit,
               "Black box packets must fit an ESP-NOW v1 payload");
+static_assert(sizeof(TemperatureReportPacket) <= kEspNowV1PayloadLimit,
+              "Temperature packets must fit an ESP-NOW v1 payload");
 static_assert(sizeof(float) == 4 && sizeof(double) == 8,
               "Protocol requires IEEE-754 32/64-bit floating point");
 

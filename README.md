@@ -398,6 +398,58 @@ Rows from before the logger knows the time go to `no-clock.csv`.
 platformio run -d atom_blackbox -t upload --upload-port COMx
 ```
 
+## Temperature probes and weather
+
+Every device with a free Grove port can read DS18B20 waterproof temperature
+probes (the common stainless steel probes on a 1 m lead), and the logger can
+add the local weather from the internet. Both are logged with every CSV row.
+
+**Wiring a probe to a Grove port**
+
+| Probe wire | Grove wire | |
+|---|---|---|
+| Red (VCC) | Red (5 V) | |
+| Black (GND) | Black (GND) | |
+| Yellow (DATA) | Yellow **or** white (signal) | Either works; both are searched |
+| | | **4.7 kΩ resistor from DATA to 3.3 V** |
+
+The data line needs a pull-up to **3.3 V, never 5 V**: the ESP32 pins only
+take 3.3 V. A Grove port only carries 5 V, so take 3.3 V from the device's
+3V3 pin (the bottom header on an Atom, the M-Bus on a Core2). Up to four
+probes can share one port, wired in parallel.
+
+| Device | Port | Notes |
+|---|---|---|
+| M5Dial | Port B or Port A | Reading shown on its CONNECTION page |
+| Atom Lite black box | Grove | Also written to its own backup CSV (`probe_c`) |
+| Atom Echo | Grove | Safe: only the Echo's bottom pins clash with an SD card |
+| Core2 | Port A (red, on the Core2) | The GPS is on the DIN base's Port B |
+| Cardputer ADV | Grove, when the Cap LoRa-1262 provides the GPS | A probe found at start-up turns the Grove GPS off for that session |
+
+Not available on the original Cardputer or the AtomS3s, whose Grove ports carry
+power between the two.
+
+**Where each probe is logged.** The CSV has three probe columns: cab, canopy
+and outside. By default the cab is the Dial's probe (or the Echo's), the
+canopy is the black box's and outside is the logger's own. To choose
+yourself, look up each probe's ID on the WEATHER page and add it to
+`/telemetry/logger.cfg`:
+
+```text
+probe_cab=1A2B
+probe_canopy=3C4D
+probe_outside=5E6F
+```
+
+**Internet weather.** While the logger is on Wi-Fi (Starlink, a hotspot or
+home) it fetches the current weather for its GPS position from
+[Open-Meteo](https://open-meteo.com/) (free, no account or key) every 15
+minutes, or sooner after moving 10 km. Offline, the weather columns stay
+empty; the probes keep working.
+
+The **WEATHER** page on the Cardputer and Core2 shows the three locations, the
+latest internet weather and the ID of every probe it can see.
+
 ## Controls
 
 | Key | Action |
@@ -728,6 +780,10 @@ errors. Seven diagnostic columns are appended.
 | `poi`, `poi_source` | Current user label/waypoint or automatic place, and its origin |
 | `auto_place` | Independently retained automatic locality name |
 | `waypoint_id` | ID of the nearby user waypoint, if one has priority |
+| `probe_cab_c`, `probe_canopy_c`, `probe_outside_c` | DS18B20 probe temperatures in °C (see [Temperature probes and weather](#temperature-probes-and-weather)); empty without a probe |
+| `wx_temp_c`, `wx_humidity_pct`, `wx_pressure_hpa` | Internet weather for the current position: air temperature, relative humidity, surface pressure |
+| `wx_wind_kmh`, `wx_wind_dir_deg`, `wx_precip_mm` | Wind speed, direction it blows from, and precipitation |
+| `wx_code`, `wx_age_min` | WMO weather code and the age of the reading in minutes; all `wx_` columns are empty until the first fetch |
 
 On the original Cardputer in `LOCAL_GPS`, IMU numeric columns remain empty. In
 `ATOMS3_REMOTE`, both original Cardputer revisions receive the AtomS3 IMU data.

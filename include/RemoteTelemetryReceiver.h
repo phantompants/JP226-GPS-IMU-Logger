@@ -25,6 +25,10 @@ class RemoteTelemetryReceiver {
   // Latest report from a black box; false if none has been heard.
   bool blackBoxStatus(telemetry::BlackBoxStatusPacket& packet,
                       uint32_t& ageMs, uint32_t nowMs) const;
+  // Latest DS18B20 report from one accessory (Dial, Echo or black box).
+  bool temperatureReport(telemetry::ProbeSource source,
+                         telemetry::TemperatureReportPacket& packet,
+                         uint32_t& ageMs, uint32_t nowMs) const;
   uint8_t controllerCount(uint32_t nowMs) const;
   // Clock, UTC offset, battery and board type copied into each beacon.
   void setBeaconInfo(uint32_t utcEpochS, int16_t utcOffsetMin,
@@ -88,6 +92,11 @@ class RemoteTelemetryReceiver {
   telemetry::BlackBoxStatusPacket blackBox_{};
   bool haveBlackBox_ = false;
   uint32_t lastBlackBoxMs_ = 0;
+  // Indexed by ProbeSource (Dial 1, Echo 2, BlackBox 3).
+  static constexpr size_t kProbeSources = 4;
+  telemetry::TemperatureReportPacket temperatures_[kProbeSources]{};
+  uint32_t temperatureMs_[kProbeSources]{};
+  bool haveTemperature_[kProbeSources]{};
   uint32_t discoverySequence_ = 0;
   uint32_t beaconUtcEpochS_ = 0;
   uint32_t beaconUtcSetMs_ = 0;

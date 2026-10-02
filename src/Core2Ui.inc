@@ -15,14 +15,15 @@ enum class Core2Page : uint8_t {
   Logger,
   Time,
   Setup,
+  Weather,
   Version,
   About,
   Count,
 };
 
 constexpr const char* kCore2PageTitles[] = {
-    "DRIVE", "HUD",   "GPS",           "IMU",        "WAYPOINT",
-    "LOGGER", "TIME", "SETUP", "FOSSIL RECORD", "JP226PRINTS"};
+    "DRIVE",  "HUD",  "GPS",   "IMU",     "WAYPOINT",      "LOGGER",
+    "TIME",   "SETUP", "WEATHER", "FOSSIL RECORD", "JP226PRINTS"};
 
 // Same categories as the M5Dial; the labels are shortened to fit a button.
 constexpr const char* kWaypointCategories[] = {
@@ -649,6 +650,50 @@ void drawCore2SetupPage(uint32_t nowMs) {
   drawButton(kBrighterBox, "+", TFT_WHITE);
 }
 
+void drawCore2WeatherPage(uint32_t nowMs) {
+  for (int i = 0; i < 3; ++i) {
+    const float c = locationCelsius(static_cast<ProbeLocation>(i), nowMs);
+    const int32_t y = 36 + i * 30;
+    drawText(kMargin, y, top_left, kFontBody, TFT_WHITE, "%s",
+             kProbeLocationNames[i]);
+    if (std::isnan(c)) {
+      drawText(kScreenWidth - kMargin, y, top_right, kFontBody, TFT_DARKGREY,
+               "--");
+    } else {
+      drawText(kScreenWidth - kMargin, y, top_right, kFontBody, TFT_CYAN,
+               "%.1f C", c);
+    }
+  }
+  WeatherReading wx;
+  if (weather.latest(wx)) {
+    drawText(kMargin, 130, top_left, kFontSmall, TFT_YELLOW,
+             "Net %.0f C  %s  %.0f%%  %.0f hPa", wx.temperatureC,
+             WeatherService::describe(wx.code), wx.humidityPct,
+             wx.pressureHpa);
+    drawText(kMargin, 150, top_left, kFontSmall, TFT_YELLOW,
+             "Wind %.0f km/h from %.0f  (%lu min ago)", wx.windKmh,
+             wx.windDirectionDeg,
+             static_cast<unsigned long>((nowMs - wx.fetchedMs) / 60000));
+  } else {
+    drawText(kMargin, 130, top_left, kFontSmall, TFT_DARKGREY, "%s",
+             locationTime.wifiConnected() ? "Internet weather: fetching"
+                                          : "Internet weather: needs Wi-Fi");
+  }
+  ProbeEntry entries[8];
+  const int count = collectProbes(entries, 8, nowMs);
+  if (count == 0) {
+    drawText(kMargin, 176, top_left, kFontSmall, TFT_DARKGREY,
+             "No probes found");
+  }
+  for (int i = 0; i < count && i < 2; ++i) {
+    drawText(kMargin, 176 + i * 18, top_left, kFontSmall, TFT_LIGHTGREY,
+             "%s %04X  %s", probeSourceName(entries[i].source), entries[i].id,
+             std::isnan(entries[i].celsius)
+                 ? "--"
+                 : String(entries[i].celsius, 1).c_str());
+  }
+}
+
 void drawCore2VersionPage(uint32_t nowMs) {
   auto& display = dashboardCanvas;
   dino::draw(display, kScreenWidth - dino::kWidth * 3 - kMargin, 40, 3,
@@ -745,6 +790,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
       break;
     case Core2Page::Setup:
       drawCore2SetupPage(nowMs);
+      break;
+    case Core2Page::Weather:
+      drawCore2WeatherPage(nowMs);
       break;
     case Core2Page::Version:
       drawCore2VersionPage(nowMs);

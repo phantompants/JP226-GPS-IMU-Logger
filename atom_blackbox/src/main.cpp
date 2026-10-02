@@ -23,6 +23,7 @@
 #include <ctime>
 
 #include "TelemetryProtocol.h"
+#include "TempProbe.h"
 #include "Version.h"
 
 namespace {
@@ -291,6 +292,23 @@ void updateRadio(uint32_t nowMs) {
   }
 }
 
+
+TempProbes probes;
+
+void sendTemperatures(uint32_t nowMs) {
+  static uint32_t lastMs = 0;
+  static uint32_t sequence = 0;
+  if (!paired || nowMs - lastMs < 10'000) return;
+  lastMs = nowMs;
+  telemetry::TemperatureReportPacket report{};
+  if (!makeTemperatureReport(probes, telemetry::ProbeSource::BlackBox, sequence++,
+                             report)) {
+    return;
+  }
+  esp_now_send(peerMac, reinterpret_cast<const uint8_t*>(&report),
+               sizeof(report));
+}
+
 // --------------------------------------------------------------- SD card
 
 void mountSd(uint32_t nowMs) {
@@ -329,7 +347,8 @@ void flushRows(uint32_t nowMs) {
     file.print(
         "utc,local_time,latitude,longitude,altitude_m,speed_kmh,course_deg,"
         "satellites,hdop,fix,log_mode,accel_x,accel_y,accel_z,gyro_x,gyro_y,"
-        "gyro_z,pitch_deg,roll_deg,vibration_rms,logger_board,sequence\n");
+        "gyro_z,pitch_deg,roll_deg,vibration_rms,logger_board,sequence,"
+        "probe_c\n");
   }
   const size_t written = file.print(rowBuffer);
   file.close();
@@ -413,8 +432,18 @@ void appendRow(const telemetry::PositionReportPacket& report, uint32_t nowMs) {
   } else {
     length += std::snprintf(row + length, sizeof(row) - length, ",,,,,,,,,");
   }
-  std::snprintf(row + length, sizeof(row) - length, "%u,%lu\n",
-                report.logger_board, static_cast<unsigned long>(report.sequence));
+  length += std::snprintf(row + length, sizeof(row) - length, "%u,%lu,",
+                          report.logger_board,
+                          static_cast<unsigned long>(report.sequence));
+  float probe = NAN;
+  for (int i = 0; i < probes.count() && std::isnan(probe); ++i) {
+    probe = probes.reading(i).celsius;
+  }
+  if (std::isnan(probe)) {
+    std::snprintf(row + length, sizeof(row) - length, "\n");
+  } else {
+    std::snprintf(row + length, sizeof(row) - length, "%.1f\n", probe);
+  }
   rowBuffer += row;
   ++bufferedRows;
   lastWrittenMs = nowMs;
@@ -553,12 +582,15 @@ void setup() {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                 version::kNumber, version::kGit, version::kDate, targetBoard);
   mountSd(millis());
+  probes.begin({26, 32});  // DS18B20 probes on the Grove port
 }
 
 void loop() {
   M5.update();
   const uint32_t nowMs = millis();
   updateRadio(nowMs);
+  probes.update(nowMs);
+  sendTemperatures(nowMs);
   updateRecording(nowMs);
   handleButton();
   updateLed(nowMs);

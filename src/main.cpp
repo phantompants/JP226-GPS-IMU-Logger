@@ -25,9 +25,11 @@
 #include "LocationTime.h"
 #include "LogSchedule.h"
 #include "PlaceResolver.h"
+#include "TempProbe.h"
 #include "RemoteTelemetryReceiver.h"
 #include "TelemetryData.h"
 #include "WaypointStore.h"
+#include "WeatherService.h"
 #include "WebPortal.h"
 #include "WifiSetupPage.h"
 
@@ -44,7 +46,10 @@ constexpr char kCsvHeader[] =
     "lateral_accel_peak_mps2,longitudinal_accel_peak_mps2,"
     "vibration_rms_mps2,imu_samples,gps_age_ms,packet_age_ms,"
     "packets_lost,duplicate_packets,crc_errors,remote_tx_failures,"
-    "poi,poi_source,auto_place,waypoint_id";
+    "poi,poi_source,auto_place,waypoint_id,"
+    "probe_cab_c,probe_canopy_c,probe_outside_c,"
+    "wx_temp_c,wx_humidity_pct,wx_pressure_hpa,wx_wind_kmh,wx_wind_dir_deg,"
+    "wx_precip_mm,wx_code,wx_age_min";
 
 constexpr float kStandardGravityMps2 = 9.80665f;
 
@@ -73,6 +78,7 @@ enum class DashboardPage : uint8_t {
   Wifi,
   Logger,
   BlackBox,
+  Weather,
   TimeNetwork,
   KmlExport,
   Waypoint,
@@ -380,6 +386,19 @@ uint32_t lastClockSyncMs = 0;
 uint32_t lastRtcWriteMs = 0;
 uint64_t rowsWritten = 0;
 uint32_t tripStartedMs = 0;
+
+// DS18B20 probes on this logger's own Grove port (Core2 Port A, or a
+// Cardputer's Grove port when a probe is found there at start-up, in which
+// case the Grove GPS is left off for that session).
+TempProbes localProbes;
+bool groveProbe = false;
+WeatherService weather;
+// Probe IDs for the three logged locations, from logger.cfg (probe_cab=1A2B
+// and so on, hex as shown on the WEATHER page). 0 uses the default device.
+uint16_t probeLocationId[3]{};
+
+enum ProbeLocation : uint8_t { ProbeCab, ProbeCanopy, ProbeOutside };
+constexpr const char* kProbeLocationNames[3] = {"CAB", "CANOPY", "OUTSIDE"};
 uint8_t displayBrightness = 128;
 size_t groveBaudIndex = 0;
 uint32_t groveBaudStartedMs = 0;
@@ -942,6 +961,102 @@ bool openDailyFile(time_t nowUtc, uint32_t nowMs) {
   return true;
 }
 
+void loadProbeLocations() {
+  File file = SD.open(config::kLoggerConfigPath, FILE_READ);
+  if (!file) return;
+  constexpr const char* kKeys[3] = {"probe_cab", "probe_canopy",
+                                    "probe_outside"};
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    const int equals = line.indexOf('=');
+    if (line.startsWith("#") || equals <= 0) continue;
+    String key = line.substring(0, equals);
+    String value = line.substring(equals + 1);
+    key.trim();
+    key.toLowerCase();
+    value.trim();
+    for (int i = 0; i < 3; ++i) {
+      if (key == kKeys[i]) {
+        probeLocationId[i] =
+            static_cast<uint16_t>(strtoul(value.c_str(), nullptr, 16));
+      }
+    }
+  }
+  file.close();
+}
+
+struct ProbeEntry {
+  telemetry::ProbeSource source;
+  uint16_t id;
+  float celsius;
+};
+
+const char* probeSourceName(telemetry::ProbeSource source) {
+  switch (source) {
+    case telemetry::ProbeSource::Dial: return "DIAL";
+    case telemetry::ProbeSource::Echo: return "ECHO";
+    case telemetry::ProbeSource::BlackBox: return "BLACK BOX";
+    case telemetry::ProbeSource::Logger: return "LOGGER";
+    default: return "?";
+  }
+}
+
+// Every probe heard in the last minute: this logger's own, then each
+// accessory's. Returns how many were written to `entries`.
+int collectProbes(ProbeEntry* entries, int capacity, uint32_t nowMs) {
+  int count = 0;
+  for (int i = 0; i < localProbes.count() && count < capacity; ++i) {
+    entries[count++] = {telemetry::ProbeSource::Logger,
+                        localProbes.reading(i).id,
+                        localProbes.reading(i).celsius};
+  }
+  for (const auto source :
+       {telemetry::ProbeSource::Dial, telemetry::ProbeSource::Echo,
+        telemetry::ProbeSource::BlackBox}) {
+    telemetry::TemperatureReportPacket report{};
+    uint32_t ageMs = 0;
+    if (!remoteReceiver.temperatureReport(source, report, ageMs, nowMs) ||
+        ageMs > 60'000) {
+      continue;
+    }
+    for (int i = 0; i < report.count && count < capacity; ++i) {
+      entries[count++] = {source, report.probe_id[i], report.celsius[i]};
+    }
+  }
+  return count;
+}
+
+// Temperature for cab, canopy or outside: the probe named in logger.cfg, or
+// by default the Dial's (else the Echo's) for the cab, the black box's for
+// the canopy and the logger's own for outside. NaN when there is none.
+float locationCelsius(ProbeLocation location, uint32_t nowMs) {
+  ProbeEntry entries[16];
+  const int count = collectProbes(entries, 16, nowMs);
+  auto first = [&](telemetry::ProbeSource source) {
+    for (int i = 0; i < count; ++i) {
+      if (entries[i].source == source && !std::isnan(entries[i].celsius)) {
+        return entries[i].celsius;
+      }
+    }
+    return NAN;
+  };
+  if (probeLocationId[location] != 0) {
+    for (int i = 0; i < count; ++i) {
+      if (entries[i].id == probeLocationId[location]) return entries[i].celsius;
+    }
+    return NAN;
+  }
+  switch (location) {
+    case ProbeCab: {
+      const float dial = first(telemetry::ProbeSource::Dial);
+      return std::isnan(dial) ? first(telemetry::ProbeSource::Echo) : dial;
+    }
+    case ProbeCanopy: return first(telemetry::ProbeSource::BlackBox);
+    default: return first(telemetry::ProbeSource::Logger);
+  }
+}
+
 bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
                  time_t nowUtc) {
   if (!clockIsReady() || !openDailyFile(nowUtc, nowMs)) return false;
@@ -1035,6 +1150,27 @@ bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
   const String escapedAutoPlace = WaypointStore::csvField(autoPlace);
   line.append(",%s,%s,%s,%s", escapedPoi.c_str(), poiSource.c_str(),
               escapedAutoPlace.c_str(), waypointId.c_str());
+  // Empty fields where there is no probe or no weather yet.
+  auto optional = [&](float value, const char* format) {
+    line.append(",");
+    if (!std::isnan(value)) line.append(format, value);
+  };
+  optional(locationCelsius(ProbeCab, nowMs), "%.1f");
+  optional(locationCelsius(ProbeCanopy, nowMs), "%.1f");
+  optional(locationCelsius(ProbeOutside, nowMs), "%.1f");
+  WeatherReading wx;
+  if (weather.latest(wx)) {
+    optional(wx.temperatureC, "%.1f");
+    optional(wx.humidityPct, "%.0f");
+    optional(wx.pressureHpa, "%.1f");
+    optional(wx.windKmh, "%.1f");
+    optional(wx.windDirectionDeg, "%.0f");
+    optional(wx.precipitationMm, "%.1f");
+    line.append(",%d,%lu", wx.code,
+                static_cast<unsigned long>((nowMs - wx.fetchedMs) / 60000));
+  } else {
+    line.append(",,,,,,,,");
+  }
 
   const size_t written = logFile.println(line.c_str());
   logFile.flush();
@@ -1123,10 +1259,10 @@ void selectGpsReceiver(uint32_t nowMs) {
 }
 
 void updateGpsReceivers(uint32_t nowMs) {
-  groveGps.poll(nowMs);
+  if (!groveProbe) groveGps.poll(nowMs);
   if (capGps.started()) capGps.poll(nowMs);
 
-  if (!groveGps.live(nowMs) &&
+  if (!groveProbe && !groveGps.live(nowMs) &&
       nowMs - groveBaudStartedMs >= config::kGpsBaudScanIntervalMs) {
     groveBaudIndex =
         (groveBaudIndex + 1) % config::kGroveGpsBaudCandidateCount;
@@ -2104,6 +2240,57 @@ void drawBlackBoxPage(uint32_t nowMs) {
   drawPageFooter();
 }
 
+// Probe temperatures by location, the internet weather and every probe's ID
+// (for probe_cab= / probe_canopy= / probe_outside= in logger.cfg).
+void drawWeatherPage(uint32_t nowMs) {
+  auto& display = dashboardCanvas;
+  drawPageTitle("WEATHER");
+  display.setTextSize(2);
+  for (int i = 0; i < 3; ++i) {
+    const float c = locationCelsius(static_cast<ProbeLocation>(i), nowMs);
+    display.setCursor(3, 25 + i * 18);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.printf("%-8s", kProbeLocationNames[i]);
+    display.setTextColor(std::isnan(c) ? TFT_DARKGREY : TFT_CYAN, TFT_BLACK);
+    if (std::isnan(c)) display.print("--");
+    else display.printf("%.1f C", c);
+  }
+  display.setTextSize(1);
+  display.setCursor(3, 82);
+  WeatherReading wx;
+  if (weather.latest(wx)) {
+    display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    display.printf("NET %.0fC %s %.0f%% %.0fhPa\n", wx.temperatureC,
+                   WeatherService::describe(wx.code), wx.humidityPct,
+                   wx.pressureHpa);
+    display.setCursor(3, 92);
+    display.printf("Wind %.0f km/h from %.0f, %lu min ago", wx.windKmh,
+                   wx.windDirectionDeg,
+                   static_cast<unsigned long>((nowMs - wx.fetchedMs) / 60000));
+  } else {
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.print(locationTime.wifiConnected() ? "Internet weather: fetching"
+                                               : "Internet weather: needs Wi-Fi");
+  }
+  ProbeEntry entries[8];
+  const int count = collectProbes(entries, 8, nowMs);
+  display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  for (int i = 0; i < count && i < 2; ++i) {
+    display.setCursor(3, 104 + i * 10);
+    display.printf("%s %04X ", probeSourceName(entries[i].source),
+                   entries[i].id);
+    if (std::isnan(entries[i].celsius)) display.print("--");
+    else display.printf("%.1f", entries[i].celsius);
+  }
+  if (count == 0) {
+    display.setCursor(3, 104);
+    display.print("No probes found");
+  } else if (count > 2) {
+    display.printf("  +%d more", count - 2);
+  }
+  drawPageFooter();
+}
+
 void drawTimeNetworkPage(time_t nowUtc) {
   auto& display = dashboardCanvas;
   drawPageTitle("TIME / NETWORK");
@@ -2379,6 +2566,9 @@ void drawStatus(const GpsSnapshot& sample, uint32_t nowMs, time_t nowUtc) {
     case DashboardPage::BlackBox:
       drawBlackBoxPage(nowMs);
       break;
+    case DashboardPage::Weather:
+      drawWeatherPage(nowMs);
+      break;
     case DashboardPage::TimeNetwork:
       drawTimeNetworkPage(nowUtc);
       break;
@@ -2572,8 +2762,20 @@ void setup() {
   webPortal.begin(SD, config::kLogDirectory, config::kKmlDirectory,
                   config::kWebHostname);
 
+#if JP226_CORE2
+  // Core2 Port A (G32/G33) is free: the GPS is on the DIN base's Port B.
+  localProbes.begin({32, 33});
+#else
+  // A probe on the Grove port at start-up takes it over from the Grove GPS
+  // (a Cardputer ADV getting its GPS from the Cap). Searched once only, so
+  // a Grove GPS keeps the pins otherwise.
+  localProbes.begin({config::kGroveGpsRxPin, config::kGroveGpsTxPin}, false);
+  groveProbe = localProbes.count() > 0;
+#endif
   groveBaudIndex = 0;
-  groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
+  if (!groveProbe) {
+    groveGps.begin(config::kGroveGpsBaudCandidates[groveBaudIndex]);
+  }
   groveBaudStartedMs = millis();
   if (isCardputerAdv()) {
     // The Cap LoRa radio and microSD share SPI pins. NSS is active-low, so
@@ -2588,6 +2790,7 @@ void setup() {
     locationTimeStarted = true;
     placeResolver.begin(SD, config::kLoggerConfigPath);
     placeResolverStarted = true;
+    loadProbeLocations();
   }
 }
 
@@ -2608,6 +2811,7 @@ void loop() {
   imu.update(nowMs);
   markLoopStep(StepImu);
   remoteReceiver.update(nowMs);
+  localProbes.update(nowMs);
 
   activeTelemetry = takeActiveTelemetry(nowMs);
   telemetry::DialCommandPacket dialCommand{};
@@ -2625,6 +2829,8 @@ void loop() {
   wifiSetup.update(nowMs);
   placeResolver.update(gpsSample.latitude, gpsSample.longitude,
                        gpsSample.positionFresh, nowMs);
+  weather.update(gpsSample.latitude, gpsSample.longitude,
+                 gpsSample.positionFresh, nowMs);
   String resolvedPlace;
   if (placeResolver.takeChange(resolvedPlace)) {
     if (clockIsReady() && sdMounted) {
@@ -2672,6 +2878,7 @@ void loop() {
   if (sdMounted && !placeResolverStarted) {
     placeResolver.begin(SD, config::kLoggerConfigPath);
     placeResolverStarted = true;
+    loadProbeLocations();
   }
   markLoopStep(StepSd);
   if (sdMounted && clockIsReady()) {
