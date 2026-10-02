@@ -1,0 +1,374 @@
+# JP226 car display: an ESP8266 + 240x240 ST7789 "smart weather clock" desk
+# display (GeekMagic SmallTV style) turned into a status screen for the
+# JP226 GPS/IMU logger. Flash it from Home Assistant's ESPHome add-on as
+# usual (over Wi-Fi; its USB-C socket is power only).
+#
+# In the car it joins the Starlink or iPhone hotspot Wi-Fi, where the
+# Cardputer broadcasts a status line every two seconds on UDP port 47226
+# (see broadcastStatus() in src/main.cpp). No IP address needs setting.
+#
+# Secrets needed in your ESPHome secrets.yaml:
+#   wifi_ssid / wifi_password                 home network (for updates)
+#   car_starlink_ssid / car_starlink_password Starlink in the vehicle
+#   car_hotspot_ssid / car_hotspot_password   iPhone Personal Hotspot
+#   jp226_car_display_ota_password
+#
+# Pages cycle by themselves: DRIVE, TILT, TRIP, STATUS, CHARITY. Choose which
+# logger it follows on its web page (http://<display ip>/): Auto, Cardputer,
+# Cardputer ADV or Core2.
+
+esphome:
+  name: jp226-car-display
+  friendly_name: JP226 Car Display
+
+esp8266:
+  board: esp01_1m
+  restore_from_flash: true
+
+preferences:
+  flash_write_interval: 1min
+
+logger:
+  level: WARN
+
+# Kept so Home Assistant can still see and update it at home. It must not
+# reboot when Home Assistant is out of reach in the car.
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret jp226_car_display_ota_password
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret car_starlink_ssid
+      password: !secret car_starlink_password
+    - ssid: !secret car_hotspot_ssid
+      password: !secret car_hotspot_password
+  # Keep running (and showing "no Wi-Fi") rather than rebooting.
+  reboot_timeout: 0s
+  ap:
+    ssid: "JP226 Car Display"
+    password: "fossilized"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+udp:
+  listen_port: 47226
+  on_receive:
+    then:
+      - lambda: |-
+          std::string line(data.begin(), data.end());
+          if (line.rfind("JP226S1|", 0) != 0) return;
+          // Field 1 is the logger board: 1 Cardputer, 2 ADV, 3 Core2.
+          size_t start = 8;
+          size_t end = line.find('|', start);
+          int board = atoi(line.substr(start, end - start).c_str());
+          std::string want = id(logger_choice).state;
+          int wanted = want == "Cardputer" ? 1
+                     : want == "Cardputer ADV" ? 2
+                     : want == "Core2" ? 3 : 0;
+          uint32_t now = millis();
+          bool current_stale = now - id(rx_ms) > 8000;
+          if (wanted != 0 && board != wanted) return;
+          // Auto: stay with the first logger heard until it goes quiet.
+          if (wanted == 0 && id(rx_board) != 0 && board != id(rx_board) &&
+              !current_stale) return;
+          id(rx_board) = board;
+          id(rx_line) = line;
+          id(rx_ms) = now;
+
+globals:
+  - id: rx_line
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: rx_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: rx_board
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+select:
+  - platform: template
+    id: logger_choice
+    name: "Logger"
+    optimistic: true
+    restore_value: true
+    options:
+      - "Auto"
+      - "Cardputer"
+      - "Cardputer ADV"
+      - "Core2"
+    initial_option: "Auto"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: display_ip
+    ssid:
+      id: display_ssid
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+  interface: hardware
+  id: spihwd
+
+output:
+  - platform: esp8266_pwm
+    pin: GPIO5
+    frequency: 200 Hz
+    inverted: true
+    id: backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Backlight"
+    id: backlight
+    restore_mode: RESTORE_DEFAULT_ON
+
+font:
+  - file: "gfonts://Roboto@700"
+    id: font_huge
+    size: 88
+    glyphs: "0123456789-"
+  - file: "gfonts://Roboto@700"
+    id: font_large
+    size: 30
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 17
+
+display:
+  - platform: mipi_spi
+    model: st7789v
+    spi_id: spihwd
+    dimensions:
+      height: 240
+      width: 240
+      offset_height: 0
+      offset_width: 0
+    invert_colors: true
+    dc_pin: GPIO0
+    reset_pin: GPIO2
+    color_depth: 8
+    spi_mode: mode3
+    update_interval: 250ms
+    id: disp
+    lambda: |-
+      const Color WHITE = Color(255, 255, 255);
+      const Color GREY = Color(150, 150, 150);
+      const Color GREEN = Color(0, 220, 0);
+      const Color ORANGE = Color(255, 150, 0);
+      const Color RED = Color(255, 40, 40);
+      const Color CYAN = Color(0, 210, 255);
+      const Color YELLOW = Color(255, 220, 0);
+      const uint32_t now = millis();
+      it.fill(Color::BLACK);
+
+      // ---- Original JP226 brontosaurus (same sprite as the M5 devices) ----
+      static const char *const DINO[2][16] = {
+        {"..................GGGG..", ".................GGGWKG.",
+         ".................GGGGGGG", ".................GGG....",
+         "................GGG.....", "...............GGG......",
+         ".......D.D.D..GGG.......", ".....GGGGGGGGGGGG.......",
+         "...GGGDGGGGDGGGGG.......", "..GGGGGGGGGGGGGGG.......",
+         ".GG.GGGGGGGGGGGGG.......", "GG...GGGGGGGGGGG........",
+         ".....GG..GG..GG..GG.....", ".....GG..GG..GG..GG.....",
+         "....GGG.GGG.GGG.GGG.....", "........................"},
+        {"..................GGGG..", ".................GGGWKG.",
+         ".................GGGGGGG", ".................GGG....",
+         "................GGG.....", "...............GGG......",
+         ".......D.D.D..GGG.......", ".....GGGGGGGGGGGG.......",
+         "...GGGDGGGGDGGGGG.......", "..GGGGGGGGGGGGGGG.......",
+         ".GG.GGGGGGGGGGGGG.......", "GG...GGGGGGGGGGG........",
+         "......GG.GG....GG.GG....", "......GG.GG....GG.GG....",
+         ".....GGGGGG...GGGGGG....", "........................"}};
+      auto draw_dino = [&](int x, int y, int scale, int frame) {
+        for (int r = 0; r < 16; r++) {
+          for (int c = 0; c < 24; c++) {
+            char p = DINO[frame % 2][r][c];
+            Color col;
+            if (p == 'G') col = Color(60, 180, 75);
+            else if (p == 'D') col = Color(30, 110, 40);
+            else if (p == 'W') col = WHITE;
+            else if (p == 'K') col = Color::BLACK;
+            else continue;
+            it.filled_rectangle(x + c * scale, y + r * scale, scale, scale, col);
+          }
+        }
+      };
+
+      // ---- Split the latest status line into fields ----
+      std::vector<std::string> f;
+      {
+        const std::string &line = id(rx_line);
+        size_t start = 0;
+        while (true) {
+          size_t bar = line.find('|', start);
+          f.push_back(line.substr(start, bar - start));
+          if (bar == std::string::npos) break;
+          start = bar + 1;
+        }
+      }
+      auto S = [&](int i) -> std::string { return i < (int)f.size() ? f[i] : ""; };
+      auto has = [&](int i) -> bool { return !S(i).empty(); };
+      auto N = [&](int i) -> float { return has(i) ? atof(S(i).c_str()) : NAN; };
+      const bool live = id(rx_ms) != 0 && now - id(rx_ms) < 8000;
+
+      // ---- No logger heard ----
+      if (!live) {
+        draw_dino(24, 20, 4, (now / 300) % 2);
+        it.print(120, 112, id(font_large), id(rx_ms) ? RED : ORANGE,
+                 TextAlign::TOP_CENTER, id(rx_ms) ? "LOGGER LOST" : "WAITING");
+        it.print(120, 148, id(font_small), WHITE, TextAlign::TOP_CENTER,
+                 "for the Cardputer on");
+        const std::string ssid = id(display_ssid).state;
+        it.printf(120, 170, id(font_small), CYAN, TextAlign::TOP_CENTER, "%s",
+                  ssid.empty() ? "(no Wi-Fi)" : ssid.c_str());
+        it.printf(120, 205, id(font_small), GREY, TextAlign::TOP_CENTER,
+                  "Display %s", id(display_ip).state.c_str());
+        return;
+      }
+
+      // Field numbers (see broadcastStatus() in src/main.cpp)
+      const int board = atoi(S(1).c_str());
+      const float speed = N(2);
+      const bool fix = S(3) == "1";
+      const std::string mode = S(5);
+      const float alt = N(18), heading = N(19), pitch = N(20), roll = N(21);
+      const char *logger = board == 2 ? "CARDPUTER ADV"
+                         : board == 3 ? "CORE2" : "CARDPUTER";
+      auto compass = [](float deg) -> const char * {
+        static const char *const dirs[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+        return dirs[((int)((deg + 22.5f) / 45.0f)) % 8];
+      };
+      auto mode_colour = [&]() -> Color {
+        if (mode == "MOVING") return GREEN;
+        if (mode == "FIX_LOST") return RED;
+        if (mode == "WAITING_FIX") return ORANGE;
+        return WHITE;
+      };
+      auto tilt_colour = [&](float a) -> Color {
+        a = fabsf(a);
+        return a < 15 ? GREEN : a < 25 ? ORANGE : RED;
+      };
+
+      // ---- Pages cycle by time ----
+      const uint32_t lengths[5] = {10000, 7000, 6000, 6000, 5000};
+      uint32_t total = 0;
+      for (uint32_t l : lengths) total += l;
+      uint32_t pos = now % total;
+      int page = 0;
+      while (pos >= lengths[page]) { pos -= lengths[page]; page++; }
+
+      // Page dots along the bottom
+      for (int i = 0; i < 5; i++) {
+        int x = 120 + (2 * i - 4) * 8;
+        if (i == page) it.filled_circle(x, 232, 3, WHITE);
+        else it.circle(x, 232, 3, GREY);
+      }
+
+      if (page == 0) {
+        // DRIVE: speed, elevation, heading
+        it.print(120, 4, id(font_small), fix ? GREEN : RED, TextAlign::TOP_CENTER,
+                 fix ? "GPS FIX" : "NO GPS FIX");
+        it.printf(120, 22, id(font_huge), fix ? WHITE : GREY,
+                  TextAlign::TOP_CENTER, "%.0f", isnan(speed) ? 0.0f : speed);
+        it.print(120, 112, id(font_small), GREY, TextAlign::TOP_CENTER, "km/h");
+        it.line(20, 140, 220, 140, GREY);
+        it.print(60, 150, id(font_small), GREY, TextAlign::TOP_CENTER, "ELEVATION");
+        if (isnan(alt)) it.print(60, 172, id(font_large), GREY, TextAlign::TOP_CENTER, "--");
+        else it.printf(60, 172, id(font_large), CYAN, TextAlign::TOP_CENTER, "%.0fm", alt);
+        it.print(180, 150, id(font_small), GREY, TextAlign::TOP_CENTER, "HEADING");
+        if (isnan(heading)) it.print(180, 172, id(font_large), GREY, TextAlign::TOP_CENTER, "--");
+        else it.printf(180, 172, id(font_large), YELLOW, TextAlign::TOP_CENTER,
+                       "%s %.0f", compass(heading), heading);
+        it.printf(120, 208, id(font_small), GREY, TextAlign::TOP_CENTER,
+                  "%s satellites", S(4).c_str());
+      } else if (page == 1) {
+        // TILT: pitch and roll, for steep tracks
+        it.print(120, 4, id(font_small), WHITE, TextAlign::TOP_CENTER, "TILT");
+        if (isnan(pitch) || isnan(roll)) {
+          it.print(120, 100, id(font_large), RED, TextAlign::TOP_CENTER, "NO IMU");
+        } else {
+          // Horizon line: tilted by roll, shifted by pitch.
+          const float r = roll * 3.14159f / 180.0f;
+          const int cx = 120;
+          const int cy = 96 + (int)std::max(-40.0f, std::min(40.0f, pitch * 1.5f));
+          const int dx = (int)(cosf(r) * 80), dy = (int)(sinf(r) * 80);
+          const Color worst = tilt_colour(fabsf(pitch) > fabsf(roll) ? pitch : roll);
+          it.line(cx - dx, cy - dy, cx + dx, cy + dy, worst);
+          it.line(cx - dx, cy - dy + 1, cx + dx, cy + dy + 1, worst);
+          it.filled_rectangle(104, 92, 32, 8, WHITE);  // the vehicle
+          it.print(60, 150, id(font_small), GREY, TextAlign::TOP_CENTER, "PITCH");
+          it.printf(60, 172, id(font_large), tilt_colour(pitch),
+                    TextAlign::TOP_CENTER, "%+.0f", pitch);
+          it.print(180, 150, id(font_small), GREY, TextAlign::TOP_CENTER, "ROLL");
+          it.printf(180, 172, id(font_large), tilt_colour(roll),
+                    TextAlign::TOP_CENTER, "%+.0f", roll);
+          it.print(120, 208, id(font_small), GREY, TextAlign::TOP_CENTER, "degrees");
+        }
+      } else if (page == 2) {
+        // TRIP
+        it.print(120, 4, id(font_small), WHITE, TextAlign::TOP_CENTER, "TRIP");
+        const unsigned long secs = strtoul(S(10).c_str(), nullptr, 10);
+        it.printf(120, 26, id(font_large), WHITE, TextAlign::TOP_CENTER,
+                  "%.1f km", N(11));
+        it.printf(120, 62, id(font_large), WHITE, TextAlign::TOP_CENTER,
+                  "%lu:%02lu", secs / 3600, (secs / 60) % 60);
+        it.printf(120, 98, id(font_large), CYAN, TextAlign::TOP_CENTER,
+                  "+%.0f m climb", N(22));
+        if (!isnan(alt))
+          it.printf(120, 136, id(font_small), GREY, TextAlign::TOP_CENTER,
+                    "now %.0f m", alt);
+        it.printf(120, 166, id(font_large), mode_colour(), TextAlign::TOP_CENTER,
+                  "%s", mode.c_str());
+        it.printf(120, 204, id(font_small), GREY, TextAlign::TOP_CENTER, "%s",
+                  S(12).c_str());
+      } else if (page == 3) {
+        // STATUS
+        it.print(120, 4, id(font_small), WHITE, TextAlign::TOP_CENTER, logger);
+        auto row = [&](int y, const char *label, const char *value, Color c) {
+          it.print(14, y, id(font_small), GREY, label);
+          it.print(226, y, id(font_small), c, TextAlign::TOP_RIGHT, value);
+        };
+        row(30, "Source", S(6).c_str(), CYAN);
+        row(54, "IMU", S(7) == "1" ? "OK" : "N/A", S(7) == "1" ? GREEN : RED);
+        row(78, "SD card", S(8) == "1" ? "OK" : "ERROR", S(8) == "1" ? GREEN : RED);
+        const int battery = atoi(S(9).c_str());
+        char bat[8];
+        snprintf(bat, sizeof(bat), battery < 0 ? "--" : "%d%%", battery);
+        row(102, "Battery", bat, battery < 0 ? GREY : battery < 20 ? RED : battery < 50 ? ORANGE : GREEN);
+        const int bb = atoi(S(15).c_str());
+        row(126, "Black box",
+            bb == 1 ? "RECORDING" : bb == 2 ? "LINKED" : bb == 3 ? "LOST" : "NONE",
+            bb == 1 ? GREEN : bb == 2 ? ORANGE : bb == 3 ? RED : GREY);
+        row(150, "Waypoint", has(14) ? S(14).c_str() : "--", WHITE);
+        it.printf(120, 178, id(font_small), YELLOW, TextAlign::TOP_CENTER, "%s",
+                  S(13).substr(0, 22).c_str());
+        it.printf(120, 204, id(font_small), GREY, TextAlign::TOP_CENTER,
+                  "Logger %s", S(17).c_str());
+      } else {
+        // CHARITY: the dinosaur runs across above the team name
+        const int span = 240 + 24 * 4;
+        draw_dino((int)((now / 20) % span) - 96, 18, 4, (now / 150) % 2);
+        for (int x = -(int)((now / 20) % 16); x < 240; x += 16)
+          it.line(x, 83, x + 8, 83, GREY);
+        it.print(120, 98, id(font_large), CYAN, TextAlign::TOP_CENTER, "The Fast and");
+        it.print(120, 132, id(font_large), CYAN, TextAlign::TOP_CENTER, "the Fossilized");
+        it.print(120, 174, id(font_small), WHITE, TextAlign::TOP_CENTER, "Raising funds for");
+        it.print(120, 196, id(font_small), YELLOW, TextAlign::TOP_CENTER,
+                 "Variety Children's Charity");
+      }
