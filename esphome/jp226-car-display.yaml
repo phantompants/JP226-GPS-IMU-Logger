@@ -60,7 +60,7 @@ web_server:
   port: 80
 
 udp:
-  listen_port: 47226
+  port: 47226
   on_receive:
     then:
       - lambda: |-
@@ -70,10 +70,10 @@ udp:
           size_t start = 8;
           size_t end = line.find('|', start);
           int board = atoi(line.substr(start, end - start).c_str());
-          std::string want = id(logger_choice).state;
-          int wanted = want == "Cardputer" ? 1
-                     : want == "Cardputer ADV" ? 2
-                     : want == "Core2" ? 3 : 0;
+          // The options are listed in board-number order, so the index of
+          // the chosen one is the board wanted (0 = Auto).
+          auto index = id(logger_choice).active_index();
+          int wanted = index.has_value() ? (int) *index : 0;
           uint32_t now = millis();
           bool current_stale = now - id(rx_ms) > 8000;
           if (wanted != 0 && board != wanted) return;
