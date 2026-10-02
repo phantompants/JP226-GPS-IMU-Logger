@@ -313,16 +313,56 @@ the waypoint type is recorded instead.
 
 Each logger announces its board type in its discovery beacon, and every
 accessory pairs only with its own type, so three kits can run side by side, a
-small herd that never wanders into the wrong *Rex-tangle*:
+small herd that never wanders into the wrong *Rex-tangle*. This is how the
+project's own Ford Ranger is set up: the main logger in the cab, two more in
+the canopy.
 
-| Kit | Logger | GPS | IMU | Accessories |
-|---|---|---|---|---|
-| 1 | Cardputer ADV | Grove GPS Unit | Built in | M5Dial, Atom Echo |
-| 2 | Core2 on a DIN base | Grove GPS Unit on Port B | AtomS3 on SPK base, by radio | AtomS3 powered from Port C |
-| 3 | Cardputer v1 | AtomS3 on Atomic GPS Base, by radio | Same AtomS3 | AtomS3 powered from the Grove port |
+| Kit | Where | Logger | GPS | IMU | Accessories |
+|---|---|---|---|---|---|
+| 1 | Cab | Cardputer ADV | Grove GPS Unit, or the Cap LoRa-1262 | Built in | M5Dial (cab probe), Atom Echo (canopy probe), Atom Lite black box (outside probe) |
+| 2 | Canopy | Cardputer v1 | AtomS3 on Atomic GPS Base, by radio | Same AtomS3 | AtomS3 powered from the Grove port |
+| 3 | Canopy | Core2 on a DIN base | Grove GPS Unit on Port B | AtomS3 on SPK base, by radio | AtomS3 powered from Port C; probe on Port A |
 
-Set the source to `OWN GPS` / `LOCAL GPS` on kit 1, `GPS+ATOM IMU` on kit 2
-and `ATOM REMOTE` on kit 3. The Grove cables to the AtomS3s carry power only.
+Set the source to `OWN GPS` / `LOCAL GPS` on kit 1, `ATOM REMOTE` on kit 2
+and `GPS+ATOM IMU` on kit 3. The Grove cables to the AtomS3s carry power only;
+every dashed line below is an ESP-NOW radio link.
+
+### Kit 1: Cardputer ADV in the cab
+
+```mermaid
+flowchart LR
+  GPS["Grove GPS Unit<br/>(or Cap LoRa-1262 GPS)"] -- Grove --> ADV["Cardputer ADV<br/>logger, built-in IMU"]
+  DIAL["M5Dial<br/>waypoints, road, settings"] -. radio .- ADV
+  ECHO["Atom Echo on SPK base<br/>spoken alerts"] -. radio .- ADV
+  BOX["Atom Lite on SPK base<br/>black box, microSD"] -. radio .- ADV
+  P1(["Probe: cab"]) -- Grove --> DIAL
+  P2(["Probe: canopy"]) -- Grove --> ECHO
+  P3(["Probe: outside"]) -- Grove --> BOX
+```
+
+With the Cap fitted, its GPS takes over and the ADV's own Grove port is free
+for a probe as well.
+
+### Kit 2: Cardputer v1 in the canopy
+
+```mermaid
+flowchart LR
+  BASE["Atomic GPS Base"] --- ATOM["AtomS3 #1<br/>GPS + IMU"]
+  ATOM -. radio .- V1["Cardputer v1<br/>logger"]
+  V1 -- "Grove (5 V power only)" --> ATOM
+```
+
+### Kit 3: Core2 in the canopy
+
+```mermaid
+flowchart LR
+  GPS["Grove GPS Unit"] -- "Port B" --> CORE2["Core2 on DIN base<br/>logger, touch screen"]
+  CORE2 -- "Port C (5 V power only)" --> ATOM["AtomS3 #2 on SPK base<br/>IMU"]
+  ATOM -. radio .- CORE2
+  PROBE(["Probe: canopy"]) -- "Port A" --> CORE2
+```
+
+### Pairing
 
 - **AtomS3:** each one's logger is listed by its own MAC in
   `kLoggerAssignments` in `atoms3_gps_imu/include/AtomConfig.h`. An unlisted
@@ -333,7 +373,10 @@ and `ATOM REMOTE` on kit 3. The Grove cables to the AtomS3s carry power only.
 - **Atom Echo:** hold its main button and press the small reset button on the
   side. It restarts, steps to the next logger and says which one ("Pairs with
   Cardputer ADV", "Cardputer", "Core 2" or "any logger"). The choice is saved.
-- **Logger:** accepts up to two controllers at once (Dial and Echo).
+- **Black box:** hold its button and press reset to toggle between the
+  Cardputer ADV (cyan) and Cardputer v1 (magenta).
+- **Logger:** accepts up to four controllers at once (Dial, Echo, black box
+  and one spare).
 
 Loggers with firmware older than this report no board type, and accessories
 pair with them as before.
@@ -430,8 +473,9 @@ Not available on the original Cardputer or the AtomS3s, whose Grove ports carry
 power between the two.
 
 **Where each probe is logged.** The CSV has three probe columns: cab, canopy
-and outside. By default the cab is the Dial's probe (or the Echo's), the
-canopy is the black box's and outside is the logger's own. To choose
+and outside. By default, matching the kits above, the cab is the Dial's
+probe, the canopy is the Echo's (or, without an Echo, the logger's own, as on
+the Core2) and outside is the black box's. To choose
 yourself, look up each probe's ID on the WEATHER page and add it to
 `/telemetry/logger.cfg`:
 
@@ -784,6 +828,8 @@ errors. Seven diagnostic columns are appended.
 | `wx_temp_c`, `wx_humidity_pct`, `wx_pressure_hpa` | Internet weather for the current position: air temperature, relative humidity, surface pressure |
 | `wx_wind_kmh`, `wx_wind_dir_deg`, `wx_precip_mm` | Wind speed, direction it blows from, and precipitation |
 | `wx_code`, `wx_age_min` | WMO weather code and the age of the reading in minutes; all `wx_` columns are empty until the first fetch |
+| `road_type` | Road type set on the M5Dial's ROAD page: `PAVED`, `GRAVEL`, `DIRT` or `TRAIL` |
+| `road_surface` | Surface condition from the same page: `DRY`, `DAMP`, `WET` or `VERY WET` |
 
 On the original Cardputer in `LOCAL_GPS`, IMU numeric columns remain empty. In
 `ATOMS3_REMOTE`, both original Cardputer revisions receive the AtomS3 IMU data.

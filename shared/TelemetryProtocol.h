@@ -40,6 +40,7 @@ enum class DialAction : std::uint8_t {
   SetSuspensionFront = 5,
   SetSuspensionRear = 6,
   SetLoad = 7,
+  SetSurface = 8,  // text: DRY, DAMP, WET or VERY WET
 };
 
 enum StatusFlag : std::uint16_t {
@@ -102,6 +103,18 @@ enum BlackBoxFlag : std::uint8_t {
   BlackBoxSdReady = 1U << 0,
   BlackBoxRecording = 1U << 1,  // A position arrived recently and was saved.
 };
+
+// Road surface condition, set on the M5Dial's ROAD page. Index 0 = not set.
+constexpr const char* kRoadSurfaces[] = {"", "DRY", "DAMP", "WET", "VERY WET"};
+constexpr int kRoadSurfaceCount =
+    sizeof(kRoadSurfaces) / sizeof(kRoadSurfaces[0]);
+
+inline std::uint8_t roadSurfaceIndex(const char* name) {
+  for (int i = 1; i < kRoadSurfaceCount; ++i) {
+    if (std::strcmp(name, kRoadSurfaces[i]) == 0) return i;
+  }
+  return 0;
+}
 
 // DialStatusPacket::link_flags
 enum LinkFlag : std::uint8_t {
@@ -200,7 +213,7 @@ struct DialStatusPacket {
   std::int8_t battery_percent;
   std::uint8_t logger_board;  // LoggerBoard
   std::uint8_t link_flags;    // LinkFlag bits
-  std::uint8_t reserved0;
+  std::uint8_t road_surface;  // Index into kRoadSurfaces; 0 = not set
   std::uint32_t crc32;
 };
 

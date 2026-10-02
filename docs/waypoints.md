@@ -27,7 +27,13 @@ platformio run -d m5dial_waypoint -t upload --upload-port COMx
 
 The Dial scans 2.4 GHz channels for the Cardputer discovery beacon, then
 displays link state and receives the Cardputer's status. On DRIVE, a short
-press opens WAYPOINT; a long press cycles DRIVE -> WAYPOINT -> SETTINGS.
+press opens WAYPOINT; a long press cycles DRIVE -> ROAD -> WAYPOINT ->
+SETTINGS -> CONNECTION -> FOSSIL RECORD -> JP226PRINTS.
+
+On ROAD, turn the knob to set the surface condition (DRY, DAMP, WET or VERY
+WET, colour-coded green to red); it is sent a second after you stop turning.
+Tap to step the road type (PAVED, GRAVEL, DIRT, TRAIL). Both are logged in
+every CSV row (`road_type`, `road_surface`) and saved with each waypoint.
 On WAYPOINT, rotate to select Generic, Photo, Camp, Fuel, Lookout, Track,
 Hazard, Interesting or Test Point; press once to capture immediately. The
 Dial shows the Cardputer-assigned ID after acknowledgement. An unconfirmed
@@ -35,8 +41,8 @@ request is retried with the same sequence; the Cardputer does not create
 duplicate waypoints from retries. If the Dial says `NO CONFIRMATION`, check
 the Cardputer's last waypoint before pressing again.
 
-On SETTINGS, rotate to select road type, front/rear tyre set pressures,
-front/rear suspension settings or vehicle load. Press to edit, rotate to
+On SETTINGS, rotate to select front/rear tyre set pressures, front/rear
+suspension settings or vehicle load. Press to edit, rotate to
 change, press to send. These values persist on the Cardputer and are
 snapshotted into subsequent waypoint rows. DRIVE shows speed, fix,
 satellites, logging mode, elapsed time since the first valid fix this boot,

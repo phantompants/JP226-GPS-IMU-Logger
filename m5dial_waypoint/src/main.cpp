@@ -72,13 +72,18 @@ uint32_t messageSinceMs = 0;
 long lastEncoderPosition = 0;
 bool longPressHandled = false;
 enum class DialPage : uint8_t {
-  Drive, Waypoint, Settings, Link, Version, About, Count
+  Drive, Road, Waypoint, Settings, Link, Version, About, Count
 };
 DialPage page = DialPage::Drive;
 bool editing = false;
 uint8_t categoryIndex = 0;
-uint8_t fieldIndex = 0;
+// SETTINGS starts at field 1: road type has its own ROAD page now.
+uint8_t fieldIndex = 1;
 uint8_t roadIndex = 0;
+// ROAD page: the surface is sent a second after the knob stops turning.
+uint8_t surfaceIndex = 1;
+bool surfaceDirty = false;
+uint32_t surfaceTurnedMs = 0;
 uint8_t frontSuspensionIndex = 1;
 uint8_t rearSuspensionIndex = 1;
 uint8_t loadIndex = 0;
@@ -265,6 +270,15 @@ void updateRadio(uint32_t nowMs) {
   portEXIT_CRITICAL(&receiveMux);
   if (gotStatus) {
     latestStatus = status;
+    if (!surfaceDirty && status.road_surface > 0 &&
+        status.road_surface < telemetry::kRoadSurfaceCount) {
+      surfaceIndex = status.road_surface;
+    }
+    for (uint8_t i = 0; i < sizeof(kRoads) / sizeof(kRoads[0]); ++i) {
+      if (std::strncmp(status.road, kRoads[i], sizeof(status.road)) == 0) {
+        roadIndex = i;
+      }
+    }
     haveStatus = true;
     lastStatusMs = nowMs;
     if (!editing) {
@@ -392,12 +406,20 @@ const char* logModeText(uint8_t mode) {
 void handleEncoder(int delta) {
   if (page == DialPage::About) {
     dinoGame.press(millis());
+  } else if (page == DialPage::Road) {
+    int next = static_cast<int>(surfaceIndex) - 1 + delta;
+    const int count = telemetry::kRoadSurfaceCount - 1;
+    while (next < 0) next += count;
+    surfaceIndex = static_cast<uint8_t>(next % count + 1);
+    surfaceDirty = true;
+    surfaceTurnedMs = millis();
   } else if (page == DialPage::Waypoint) {
     cycleIndex(categoryIndex, delta, kCategories);
   } else if (page == DialPage::Settings && !editing) {
-    int next = static_cast<int>(fieldIndex) + delta;
-    while (next < 0) next += 6;
-    fieldIndex = static_cast<uint8_t>(next % 6);
+    // Fields 1-5; road type (field 0) is on the ROAD page.
+    int next = static_cast<int>(fieldIndex) - 1 + delta;
+    while (next < 0) next += 5;
+    fieldIndex = static_cast<uint8_t>(next % 5 + 1);
   } else if (page == DialPage::Settings) {
     switch (fieldIndex) {
       case 0: cycleIndex(roadIndex, delta, kRoads); break;
@@ -437,6 +459,9 @@ void handleControls() {
                     kCategories[categoryIndex]);
       } else if (page == DialPage::Drive) {
         page = DialPage::Waypoint;
+      } else if (page == DialPage::Road) {
+        cycleIndex(roadIndex, 1, kRoads);
+        sendCommand(telemetry::DialAction::SetRoad, kRoads[roadIndex]);
       } else if (page == DialPage::Link) {
         cycleTargetBoard();
       } else if (!editing) {
@@ -572,7 +597,7 @@ void drawWaypointPage(M5Canvas& display) {
 }
 
 void drawSettingsPage(M5Canvas& display) {
-  centerText(display, 46, 2, TFT_LIGHTGREY, "%u/6 %s", fieldIndex + 1,
+  centerText(display, 46, 2, TFT_LIGHTGREY, "%u/5 %s", fieldIndex,
              kFieldNames[fieldIndex]);
   centerText(display, 76, 4, editing ? YELLOW : WHITE, "%s",
              fieldValue().c_str());
@@ -655,6 +680,36 @@ void drawLinkPage(M5Canvas& display, uint32_t nowMs) {
   drawHint(display, "TAP:CHANGE HOLD:PAGE");
 }
 
+uint16_t surfaceColor(uint8_t index) {
+  switch (index) {
+    case 1: return GREEN;
+    case 2: return YELLOW;
+    case 3: return ORANGE;
+    case 4: return RED;
+    default: return TFT_DARKGREY;
+  }
+}
+
+void drawRoadPage(M5Canvas& display) {
+  centerText(display, 44, 2, TFT_LIGHTGREY, "ROAD");
+  centerText(display, 64, 4, WHITE, "%s", kRoads[roadIndex]);
+  centerText(display, 112, 2, TFT_LIGHTGREY, "SURFACE");
+  centerText(display, 132, 4, surfaceColor(surfaceIndex), "%s",
+             telemetry::kRoadSurfaces[surfaceIndex]);
+  if (surfaceDirty) centerText(display, 176, 1, YELLOW, "SENDING...");
+  drawHint(display, "TURN:SURFACE TAP:ROAD");
+}
+
+// Sends the surface once the knob has rested for a second.
+void updateSurface(uint32_t nowMs) {
+  if (!surfaceDirty || nowMs - surfaceTurnedMs < 1000 || pendingSequence != 0)
+    return;
+  if (!paired) return;  // Kept dirty until there is a logger to send to.
+  sendCommand(telemetry::DialAction::SetSurface,
+              telemetry::kRoadSurfaces[surfaceIndex]);
+  surfaceDirty = false;
+}
+
 void drawVersionPage(M5Canvas& display, uint32_t nowMs) {
   dino::draw(display, kCenter - dino::kWidth, 40, 2,
              (nowMs / 4000) % dino::kFrameCount);
@@ -708,6 +763,7 @@ void draw() {
   const char* title = page == DialPage::Waypoint ? "WAYPOINT"
                       : page == DialPage::Settings ? "SETTINGS"
                       : page == DialPage::Link ? "CONNECTION"
+                      : page == DialPage::Road ? "ROAD"
                       : page == DialPage::Version ? "FOSSIL RECORD"
                       : page == DialPage::About ? "JP226PRINTS"
                       : linked ? "LINKED" : "SEARCHING";
@@ -717,6 +773,7 @@ void draw() {
     case DialPage::Waypoint: drawWaypointPage(display); break;
     case DialPage::Settings: drawSettingsPage(display); break;
     case DialPage::Link: drawLinkPage(display, millis()); break;
+    case DialPage::Road: drawRoadPage(display); break;
     case DialPage::Version: drawVersionPage(display, millis()); break;
     case DialPage::About: drawAboutPage(display, millis()); break;
     default: break;
@@ -762,6 +819,7 @@ void loop() {
   updateRadio(nowMs);
   probes.update(nowMs);
   sendTemperatures(nowMs);
+  updateSurface(nowMs);
   handleControls();
   static uint32_t lastDrawMs = 0;
   // The dinosaur page animates; everything else redraws four times a second.

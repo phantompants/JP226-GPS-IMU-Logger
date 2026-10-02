@@ -8,6 +8,7 @@
 
 struct VehicleContext {
   String roadType;
+  String roadSurface;  // DRY, DAMP, WET or VERY WET; empty if not set
   float tyreSetFrontPsi = NAN;
   float tyreSetRearPsi = NAN;
   String suspensionFront;

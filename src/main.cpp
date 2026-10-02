@@ -49,7 +49,7 @@ constexpr char kCsvHeader[] =
     "poi,poi_source,auto_place,waypoint_id,"
     "probe_cab_c,probe_canopy_c,probe_outside_c,"
     "wx_temp_c,wx_humidity_pct,wx_pressure_hpa,wx_wind_kmh,wx_wind_dir_deg,"
-    "wx_precip_mm,wx_code,wx_age_min";
+    "wx_precip_mm,wx_code,wx_age_min,road_type,road_surface";
 
 constexpr float kStandardGravityMps2 = 9.80665f;
 
@@ -1028,8 +1028,8 @@ int collectProbes(ProbeEntry* entries, int capacity, uint32_t nowMs) {
 }
 
 // Temperature for cab, canopy or outside: the probe named in logger.cfg, or
-// by default the Dial's (else the Echo's) for the cab, the black box's for
-// the canopy and the logger's own for outside. NaN when there is none.
+// by default the Dial's for the cab, the Echo's (else the logger's own) for
+// the canopy and the black box's for outside. NaN when there is none.
 float locationCelsius(ProbeLocation location, uint32_t nowMs) {
   ProbeEntry entries[16];
   const int count = collectProbes(entries, 16, nowMs);
@@ -1048,12 +1048,12 @@ float locationCelsius(ProbeLocation location, uint32_t nowMs) {
     return NAN;
   }
   switch (location) {
-    case ProbeCab: {
-      const float dial = first(telemetry::ProbeSource::Dial);
-      return std::isnan(dial) ? first(telemetry::ProbeSource::Echo) : dial;
+    case ProbeCab: return first(telemetry::ProbeSource::Dial);
+    case ProbeCanopy: {
+      const float echo = first(telemetry::ProbeSource::Echo);
+      return std::isnan(echo) ? first(telemetry::ProbeSource::Logger) : echo;
     }
-    case ProbeCanopy: return first(telemetry::ProbeSource::BlackBox);
-    default: return first(telemetry::ProbeSource::Logger);
+    default: return first(telemetry::ProbeSource::BlackBox);
   }
 }
 
@@ -1171,6 +1171,8 @@ bool writeCsvRow(const NormalizedTelemetry& telemetryData, uint32_t nowMs,
   } else {
     line.append(",,,,,,,,");
   }
+  line.append(",%s,%s", WaypointStore::csvField(vehicleContext.roadType).c_str(),
+              WaypointStore::csvField(vehicleContext.roadSurface).c_str());
 
   const size_t written = logFile.println(line.c_str());
   logFile.flush();
@@ -1463,6 +1465,12 @@ void handleDialCommand(const telemetry::DialCommandPacket& command) {
       }
       accepted = true;
     }
+  } else if (action == telemetry::DialAction::SetSurface) {
+    if (telemetry::roadSurfaceIndex(value.c_str()) != 0) {
+      vehicleContext.roadSurface = value;
+      preferences.putString("surface", value);
+      accepted = true;
+    }
   } else if (action == telemetry::DialAction::SetSuspensionFront) {
     vehicleContext.suspensionFront = value;
     preferences.putString("susp_f", value);
@@ -1568,6 +1576,8 @@ void sendDialStatus(uint32_t nowMs) {
   if (locationTime.wifiConnected()) status.link_flags |= telemetry::WifiOnline;
   if (sdMounted) status.link_flags |= telemetry::SdReady;
   vehicleContext.roadType.toCharArray(status.road, sizeof(status.road));
+  status.road_surface =
+      telemetry::roadSurfaceIndex(vehicleContext.roadSurface.c_str());
   vehicleContext.suspensionFront.toCharArray(
       status.suspension_front, sizeof(status.suspension_front));
   vehicleContext.suspensionRear.toCharArray(
@@ -2705,6 +2715,7 @@ void loadPersistentState() {
     persistedStopPending = persistedStopStartUtc > 0 && persistedNextDueUtc > 0;
   }
   vehicleContext.roadType = preferences.getString("road", "");
+  vehicleContext.roadSurface = preferences.getString("surface", "");
   vehicleContext.tyreSetFrontPsi = preferences.getFloat("tyre_f", NAN);
   vehicleContext.tyreSetRearPsi = preferences.getFloat("tyre_r", NAN);
   vehicleContext.suspensionFront = preferences.getString("susp_f", "");

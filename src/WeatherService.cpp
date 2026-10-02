@@ -16,6 +16,13 @@ float jsonFloat(JsonVariantConst value) {
   return value.is<float>() ? value.as<float>() : NAN;
 }
 
+// The lookup cannot verify the server's certificate (no certificate store
+// on the device), so values outside physical limits are dropped rather than
+// logged.
+float within(float value, float low, float high) {
+  return std::isnan(value) || value < low || value > high ? NAN : value;
+}
+
 }  // namespace
 
 void WeatherService::update(double latitude, double longitude,
@@ -70,6 +77,13 @@ void WeatherService::runFetch() {
         result.windKmh = jsonFloat(current["wind_speed_10m"]);
         result.windDirectionDeg = jsonFloat(current["wind_direction_10m"]);
         result.code = current["weather_code"] | -1;
+        result.temperatureC = within(result.temperatureC, -60, 60);
+        result.humidityPct = within(result.humidityPct, 0, 100);
+        result.pressureHpa = within(result.pressureHpa, 300, 1100);
+        result.precipitationMm = within(result.precipitationMm, 0, 500);
+        result.windKmh = within(result.windKmh, 0, 400);
+        result.windDirectionDeg = within(result.windDirectionDeg, 0, 360);
+        if (result.code < 0 || result.code > 99) result.code = -1;
         result.valid = !std::isnan(result.temperatureC);
       }
     }

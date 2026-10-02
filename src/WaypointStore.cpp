@@ -81,7 +81,7 @@ bool WaypointStore::appendWaypoint(const WaypointRecord& record,
         "heading_deg,poi_name,poi_source,user_note,photo_reference,road_type,"
         "tyre_set_front_psi,tyre_set_rear_psi,suspension_front,"
         "suspension_rear,vehicle_load,telemetry_source,category,revision,"
-        "record_action,recorded_at") == 0) {
+        "record_action,recorded_at,road_surface") == 0) {
       file.close();
       return false;
     }
@@ -103,7 +103,8 @@ bool WaypointStore::appendWaypoint(const WaypointRecord& record,
          csvField(record.vehicle.suspensionRear) + ',' +
          csvField(record.vehicle.vehicleLoad) + ',' +
          csvField(record.telemetrySource) + ',' + csvField(record.category) +
-         ',' + String(record.revision) + ',' + action + ',' + recordedAt;
+         ',' + String(record.revision) + ',' + action + ',' + recordedAt +
+         ',' + csvField(record.vehicle.roadSurface);
 
   const size_t written = file.println(row);
   file.flush();
@@ -237,6 +238,7 @@ void WaypointStore::saveLast() {
   preferences_->putString("wp_photo", last_.photoReference);
   preferences_->putString("wp_cat", last_.category);
   preferences_->putString("wp_road", last_.vehicle.roadType);
+  preferences_->putString("wp_surf", last_.vehicle.roadSurface);
   preferences_->putFloat("wp_front", last_.vehicle.tyreSetFrontPsi);
   preferences_->putFloat("wp_rear", last_.vehicle.tyreSetRearPsi);
   preferences_->putString("wp_susf", last_.vehicle.suspensionFront);
@@ -263,6 +265,7 @@ void WaypointStore::loadLast() {
   last_.photoReference = preferences_->getString("wp_photo", "");
   last_.category = preferences_->getString("wp_cat", "GENERIC");
   last_.vehicle.roadType = preferences_->getString("wp_road", "");
+  last_.vehicle.roadSurface = preferences_->getString("wp_surf", "");
   last_.vehicle.tyreSetFrontPsi = preferences_->getFloat("wp_front", NAN);
   last_.vehicle.tyreSetRearPsi = preferences_->getFloat("wp_rear", NAN);
   last_.vehicle.suspensionFront = preferences_->getString("wp_susf", "");
